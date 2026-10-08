@@ -1,4 +1,4 @@
-"""Kalan kullanim hesabi. Her saglayici icin elde edilebilen en iyi kaynagi kullanir."""
+"""Remaining usage calculation. Uses the best available resource for each provider."""
 import glob, json, os, re, subprocess, threading, time
 import providers as P
 
@@ -6,7 +6,7 @@ CLAUDE_DIR = os.path.expanduser("~/.claude")
 DAY = 86400
 
 CLAUDE_LIVE_CACHE = os.path.join(P.CONFIG_DIR, "claude_live.json")
-CLAUDE_LIVE_TTL = 120          # sn: bu suenin altinda yeniden cagirma
+CLAUDE_LIVE_TTL = 120          # sec: do not re-fetch below this duration
 _refresh_lock = threading.Lock()
 _refreshing = False
 
@@ -20,7 +20,7 @@ SPAN_RE = re.compile(r"Last\s+(\d+\s*\w+)\s*[·|-]\s*([\d.,]+)\s*requests?"
 
 
 def parse_claude_usage(text):
-    """`claude -p /usage` ciktisini yapisal hale getirir."""
+    """Parses `claude -p /usage` output into a structured format."""
     t = ANSI.sub("", text or "")
     limits = []
     for label, pct, reset in LIMIT_RE.findall(t):
@@ -54,7 +54,7 @@ def _read_live_cache():
 
 
 def fetch_claude_live(timeout=120):
-    """`claude -p /usage` calistirip onbellege yazar. Bloklar - arka planda cagir."""
+    """Runs `claude -p /usage` and writes to cache. Blocks - call in background."""
     try:
         r = subprocess.run(["claude", "-p", "/usage"], capture_output=True, text=True,
                            timeout=timeout, cwd="/tmp",
@@ -64,12 +64,12 @@ def fetch_claude_live(timeout=120):
         ok = bool(parsed["limits"])
         data = {"ts": int(time.time()), "ok": ok, **parsed}
         if not ok:
-            data["error"] = (out.strip()[:300] or "cikti bos")
+            data["error"] = (out.strip()[:300] or "output empty")
     except subprocess.TimeoutExpired:
-        data = {"ts": int(time.time()), "ok": False, "error": f"zaman asimi ({timeout}s)",
+        data = {"ts": int(time.time()), "ok": False, "error": f"timeout ({timeout}s)",
                 "limits": [], "spans": []}
     except FileNotFoundError:
-        data = {"ts": int(time.time()), "ok": False, "error": "claude CLI bulunamadi",
+        data = {"ts": int(time.time()), "ok": False, "error": "claude CLI not found",
                 "limits": [], "spans": []}
     except Exception as e:
         data = {"ts": int(time.time()), "ok": False,
@@ -84,7 +84,7 @@ def fetch_claude_live(timeout=120):
 
 
 def claude_live(max_age=CLAUDE_LIVE_TTL, block_if_empty=False):
-    """Onbellekten canli kota; bayatsa arka planda tazeler (panoyu bloklamaz)."""
+    """Live quota from cache; refreshes in background if stale (does not block the dashboard)."""
     global _refreshing
     cached = _read_live_cache()
     age = (int(time.time()) - cached["ts"]) if cached else None
@@ -109,7 +109,7 @@ def claude_live(max_age=CLAUDE_LIVE_TTL, block_if_empty=False):
 
     if cached is None:
         return {"ok": False, "pending": True, "refreshing": True, "limits": [], "spans": [],
-                "note": "ilk olcum aliniyor (claude -p /usage)"}
+                "note": "fetching initial measurement (claude -p /usage)"}
     return {**cached, "age_sec": age, "refreshing": _refreshing}
 
 
@@ -149,13 +149,13 @@ def _local_day_start():
 
 
 def _model_breakdown(provider, rows_today, now, model_limits, free_limits=None):
-    """Model bazli limitleri olan saglayicilar icin (Gemini) model model kota."""
+    """Per-model quota for providers with model-based limits (Gemini)."""
     seen = {}
     for r in rows_today:
         if r["provider"] != provider:
             continue
         seen.setdefault(r["model"], []).append(r)
-    # limiti tanimli ama bugun kullanilmamis modelleri de goster
+    # show models that have defined limits but were not used today
     for m in model_limits:
         seen.setdefault(m, [])
 
@@ -179,24 +179,24 @@ def _model_breakdown(provider, rows_today, now, model_limits, free_limits=None):
             if lim.get("rpd"):
                 q["day_requests"] = {"used": len(rs), "limit": lim["rpd"],
                                      "remaining": max(0, lim["rpd"] - len(rs)),
-                                     "reset": "gunluk"}
+                                     "reset": "daily"}
             if lim.get("rpm"):
                 q["min_requests"] = {"used": len(last_min), "limit": lim["rpm"],
                                      "remaining": max(0, lim["rpm"] - len(last_min)),
-                                     "reset": "60 sn"}
+                                     "reset": "60 sec"}
             if lim.get("tpm"):
                 q["min_tokens"] = {"used": tok_min, "limit": lim["tpm"],
                                    "remaining": max(0, lim["tpm"] - tok_min),
-                                   "reset": "60 sn"}
+                                   "reset": "60 sec"}
             row["quota"] = q
         if free:
             over = []
             if free.get("rpd") and len(rs) > free["rpd"]:
-                over.append(f"gunluk istek {len(rs)}>{free['rpd']}")
+                over.append(f"daily requests {len(rs)}>{free['rpd']}")
             if free.get("rpm") and len(last_min) > free["rpm"]:
-                over.append(f"dk istek {len(last_min)}>{free['rpm']}")
+                over.append(f"min requests {len(last_min)}>{free['rpm']}")
             if free.get("tpm") and tok_min > free["tpm"]:
-                over.append(f"dk token {tok_min}>{free['tpm']}")
+                over.append(f"min tokens {tok_min}>{free['tpm']}")
             row["free_tier"] = {
                 "limits": free,
                 "day_remaining": max(0, free["rpd"] - len(rs)) if free.get("rpd") else None,
@@ -207,7 +207,7 @@ def _model_breakdown(provider, rows_today, now, model_limits, free_limits=None):
 
 
 def workers_usage():
-    """Isci modellerin kullanimi: canli kota + yerel sayac."""
+    """Worker models usage: live quota + local counter."""
     day0 = _local_day_start()
     rows_today = _ledger(day0)
     now = int(time.time())
@@ -226,7 +226,7 @@ def workers_usage():
             "today_tokens_in": sum(r.get("in") or 0 for r in mine),
             "today_tokens_out": sum(r.get("out") or 0 for r in mine),
             "last_minute_requests": sum(1 for r in rows_min if r["provider"] == prov),
-            "source": "yerel sayac",
+            "source": "local counter",
             "quota": None,
         }
 
@@ -242,7 +242,7 @@ def workers_usage():
                         "tokens": {"remaining": rt, "limit": lt,
                                    "reset": s.get("reset-tokens")},
                     }
-                    rec["source"] = "canli (yanit header'lari)"
+                    rec["source"] = "live (response headers)"
                     rec["as_of_age_sec"] = now - int(s.get("ts", now))
                 except (TypeError, ValueError):
                     pass
@@ -253,13 +253,13 @@ def workers_usage():
                 f = info.get("free_model_daily_requests") or {}
                 rec["quota"] = {
                     "requests": {"remaining": f.get("remaining"), "limit": f.get("limit"),
-                                 "used": f.get("used"), "reset": "gunluk (UTC)"},
+                                 "used": f.get("used"), "reset": "daily (UTC)"},
                 }
                 rec["credits"] = {"limit": info.get("limit"),
                                   "remaining": info.get("limit_remaining"),
                                   "usage": info.get("usage")}
                 rec["free_tier"] = info.get("is_free_tier")
-                rec["source"] = "canli (/api/v1/key)"
+                rec["source"] = "live (/api/v1/key)"
                 rec["as_of_age_sec"] = 0
             else:
                 rec["note"] = info.get("error")
@@ -268,35 +268,35 @@ def workers_usage():
             lim = limits.get("gemini") or {}
             model_limits = lim.get("models") or {}
             rec["tier"] = lim.get("tier")
-            rec["source"] = "yerel sayac (Gemini kota header'i vermiyor)"
+            rec["source"] = "local counter (Gemini does not provide quota headers)"
             if model_limits:
                 rec["models"] = _model_breakdown(prov, rows_today, now, model_limits,
                                                  lim.get("free_tier_models"))
                 rec["per_model_limits"] = True
             else:
-                # eski, saglayici duzeyinde limit tanimi
+                # legacy provider-level limit definition
                 rpd, rpm = lim.get("requests_per_day"), lim.get("requests_per_minute")
                 if rpd or rpm:
                     rec["quota"] = {}
                     if rpd:
                         rec["quota"]["requests"] = {
                             "remaining": max(0, rpd - len(mine)), "limit": rpd,
-                            "used": len(mine), "reset": "gunluk"}
+                            "used": len(mine), "reset": "daily"}
                     if rpm:
                         rec["quota"]["per_minute"] = {
                             "remaining": max(0, rpm - rec["last_minute_requests"]),
                             "limit": rpm, "used": rec["last_minute_requests"]}
                 else:
-                    rec["note"] = ("Limit tanimli degil: config.json -> "
+                    rec["note"] = ("Limit not defined: config.json -> "
                                    "limits.gemini.models")
         out.append(rec)
     return out
 
 
 def claude_usage():
-    """Claude tarafi: transcript'lerden gercek token tuketimi + son kota olayi.
+    """Claude side: actual token consumption from transcripts + last quota event.
 
-    Not: abonelik 'kalan %' degeri sunucu tarafinda; yerelde surekli bir besleme yok.
+    Note: subscription 'remaining %' value is server-side; there is no continuous local feed.
     """
     day0 = _local_day_start()
     files = glob.glob(os.path.join(CLAUDE_DIR, "projects", "**", "*.jsonl"), recursive=True)
@@ -320,7 +320,7 @@ def claude_usage():
                 msg = m.get("message") or {}
                 u = msg.get("usage") or m.get("usage")
                 if isinstance(u, dict):
-                    model = msg.get("model") or m.get("model") or "bilinmiyor"
+                    model = msg.get("model") or m.get("model") or "unknown"
                     d = by_model.setdefault(model, {"in": 0, "out": 0, "cache_read": 0,
                                                     "cache_write": 0, "calls": 0})
                     d["in"] += u.get("input_tokens") or 0
@@ -332,7 +332,7 @@ def claude_usage():
         except OSError:
             continue
 
-    # gecmis kota olaylarini da tara (bugun dosyasi yoksa son bilinen durum)
+    # scan past quota events too (last known state if no file for today)
     if last_quota is None:
         for fp in sorted(files, key=os.path.getmtime, reverse=True)[:40]:
             try:
@@ -360,8 +360,8 @@ def claude_usage():
         } if by_model else {},
         "last_quota_event": last_quota,
         "live": claude_live(),
-        "caveat": ("Canli yuzdeler `claude -p /usage` ciktisindan gelir ve bu makinedeki "
-                   "oturumlara dayanir; diger cihazlar ve claude.ai dahil degildir."),
+        "caveat": ("Live percentages come from `claude -p /usage` output and rely on "
+                   "sessions on this machine; other devices and claude.ai are not included."),
     }
 
 
@@ -371,14 +371,14 @@ def snapshot():
 
 
 def format_report(snap):
-    out = ["# Kalan kullanim", "", "## Isci modeller"]
+    out = ["# Remaining usage", "", "## Worker models"]
     for w in snap["workers"]:
         if not w["ready"]:
-            out.append(f"- {w['provider']}: anahtar yok")
+            out.append(f"- {w['provider']}: no key")
             continue
         if w.get("models") and w.get("per_model_limits"):
-            out.append(f"- {w['provider']} ({w.get('tier') or 'model bazli limit'}): "
-                       f"bugun {w['today_requests']} istek | kaynak: {w['source']}")
+            out.append(f"- {w['provider']} ({w.get('tier') or 'per-model limit'}): "
+                       f"today {w['today_requests']} requests | source: {w['source']}")
             for m in w["models"]:
                 mq = m.get("quota") or {}
                 dq = mq.get("day_requests") or {}
@@ -388,71 +388,71 @@ def format_report(snap):
                     continue
                 pct = dq["remaining"] / dq["limit"] * 100 if dq.get("limit") else None
                 out.append(
-                    f"  - {m['model']}: KALAN {dq['remaining']}/{dq['limit']} gunluk istek"
-                    + (f" (%{pct:.0f})" if pct is not None else "")
-                    + f" | dk istek {rpm.get('used')}/{rpm.get('limit')}"
-                    + f" | dk token {tpm.get('used')}/{tpm.get('limit')}"
-                    + f" | bugun {m['requests_today']} istek, {m['tokens_today']} token")
+                    f"  - {m['model']}: REMAINING {dq['remaining']}/{dq['limit']} daily requests"
+                    + (f" ({pct:.0f}%)" if pct is not None else "")
+                    + f" | min requests {rpm.get('used')}/{rpm.get('limit')}"
+                    + f" | min tokens {tpm.get('used')}/{tpm.get('limit')}"
+                    + f" | today {m['requests_today']} requests, {m['tokens_today']} tokens")
                 ft = m.get("free_tier") or {}
                 if ft.get("exceeded"):
-                    out.append(f"    ! UCRETSIZ KATMAN ASILDI: {', '.join(ft['exceeded'])}")
+                    out.append(f"    ! FREE TIER EXCEEDED: {', '.join(ft['exceeded'])}")
                 elif ft.get("day_remaining") is not None:
-                    out.append(f"    ucretsiz katmanda kalirdi: "
-                               f"{ft['day_remaining']}/{ft['limits']['rpd']} gunluk istek")
+                    out.append(f"    would remain in free tier: "
+                               f"{ft['day_remaining']}/{ft['limits']['rpd']} daily requests")
             if w.get("today_failed"):
-                out.append(f"  ! {w['today_failed']} basarisiz istek")
+                out.append(f"  ! {w['today_failed']} failed requests")
             continue
 
         q = w.get("quota") or {}
         rq = q.get("requests") or {}
-        bits = [f"bugun {w['today_requests']} istek",
-                f"{w['today_tokens_in']}+{w['today_tokens_out']} token"]
+        bits = [f"today {w['today_requests']} requests",
+                f"{w['today_tokens_in']}+{w['today_tokens_out']} tokens"]
         if rq.get("limit"):
             pct = (rq["remaining"] / rq["limit"] * 100) if rq.get("remaining") is not None else None
-            bits.insert(0, f"KALAN {rq['remaining']}/{rq['limit']}"
-                           + (f" (%{pct:.0f})" if pct is not None else ""))
+            bits.insert(0, f"REMAINING {rq['remaining']}/{rq['limit']}"
+                           + (f" ({pct:.0f}%)" if pct is not None else ""))
             if rq.get("reset"):
-                bits.append(f"sifirlanma: {rq['reset']}")
+                bits.append(f"resets: {rq['reset']}")
         if q.get("tokens", {}).get("limit"):
             t = q["tokens"]
-            bits.append(f"token penceresi {t['remaining']}/{t['limit']}")
+            bits.append(f"token window {t['remaining']}/{t['limit']}")
         if w.get("today_failed"):
-            bits.append(f"{w['today_failed']} BASARISIZ")
+            bits.append(f"{w['today_failed']} FAILED")
         out.append(f"- {w['provider']}: " + " | ".join(bits))
-        out.append(f"  kaynak: {w['source']}")
+        out.append(f"  source: {w['source']}")
         if w.get("note"):
-            out.append(f"  not: {w['note']}")
+            out.append(f"  note: {w['note']}")
     c = snap["claude"]
     live = c.get("live") or {}
-    out += ["", "## Claude (canli abonelik limitleri)"]
+    out += ["", "## Claude (live subscription limits)"]
     if live.get("pending"):
-        out.append("- ilk olcum aliniyor (claude -p /usage), birkac saniye sonra tekrar sor")
+        out.append("- fetching initial measurement (claude -p /usage), ask again in a few seconds")
     elif live.get("ok") and live.get("limits"):
         age = live.get("age_sec") or 0
         for L in live["limits"]:
-            out.append(f"- {L['label']}: KALAN %{L['remaining_pct']} "
-                       f"(%{L['used_pct']} kullanildi)"
-                       + (f", sifirlanma {L['resets']}" if L.get("resets") else ""))
+            out.append(f"- {L['label']}: REMAINING {L['remaining_pct']}% "
+                       f"({L['used_pct']}% used)"
+                       + (f", resets {L['resets']}" if L.get("resets") else ""))
         spans = ", ".join(
-            f"{x['span']}: {x['requests']} istek"
-            + (f"/{x['sessions']} oturum" if x.get("sessions") else "")
+            f"{x['span']}: {x['requests']} requests"
+            + (f"/{x['sessions']} sessions" if x.get("sessions") else "")
             for x in (live.get("spans") or []))
         if spans:
-            out.append(f"- Anthropic sayimi -> {spans}")
-        out.append(f"- olcum yasi: {age} sn (120 sn onbellek)")
+            out.append(f"- Anthropic count -> {spans}")
+        out.append(f"- measurement age: {age} sec (120 sec cache)")
     elif live.get("error"):
-        out.append(f"- canli limit alinamadi: {live['error']}")
+        out.append(f"- could not fetch live limits: {live['error']}")
     tt = c.get("totals") or {}
-    out += ["", "## Claude (yerel transcript sayimi, bugun)",
-            f"- {tt.get('calls', 0)} istek | cikis {tt.get('out', 0)} tok | "
-            f"onbellek okuma {tt.get('cache_read', 0)} tok | {c.get('today_sessions', 0)} oturum"]
+    out += ["", "## Claude (local transcript count, today)",
+            f"- {tt.get('calls', 0)} requests | output {tt.get('out', 0)} tok | "
+            f"cache read {tt.get('cache_read', 0)} tok | {c.get('today_sessions', 0)} sessions"]
     q = None if (live.get("ok") and live.get("limits")) else c.get("last_quota_event")
     if q:
         import datetime
         ts = datetime.datetime.fromtimestamp(q["resetsAt"])
         past = ts < datetime.datetime.now()
-        out.append(f"- son limit olayi: {q.get('rateLimitType')} / {q.get('status')}, "
-                   f"sifirlanma {ts:%Y-%m-%d %H:%M}" + (" (GECMIS, guncel degil)" if past else ""))
+        out.append(f"- last limit event: {q.get('rateLimitType')} / {q.get('status')}, "
+                   f"resets {ts:%Y-%m-%d %H:%M}" + (" (PAST, not up to date)" if past else ""))
     out.append(f"- {c.get('caveat')}")
     return "\n".join(out)
 

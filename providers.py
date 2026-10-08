@@ -1,7 +1,7 @@
-"""Ucretsiz API saglayicilari icin tek kod yolu (hepsi OpenAI-uyumlu chat endpoint)."""
+"""Single code path for free API providers (all OpenAI-compatible chat endpoints)."""
 import json, os, threading, time, urllib.request, urllib.error
 
-UA = "ai-workers/1.0 (+https://github.com/local/ai-workers) python-urllib"
+UA = "ai-workers/1.2 (+https://github.com/msozturktr/ai-workers) python-urllib"
 
 CONFIG_DIR = os.path.expanduser("~/.config/ai-workers")
 ENV_FILE = os.path.join(CONFIG_DIR, "env")
@@ -9,7 +9,7 @@ CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
 
 def _load_env_file():
-    """~/.config/ai-workers/env dosyasindaki KEY=VAL satirlarini ortama ekler."""
+    """Adds KEY=VAL lines in ~/.config/ai-workers/env file to the environment."""
     try:
         with open(ENV_FILE) as f:
             for line in f:
@@ -31,7 +31,7 @@ PROVIDERS = {
         "key_env": ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
         "default_model": "gemini-3.6-flash",
         "light_model": "gemini-3.5-flash-lite",
-        # 1M token context; Tier 1 ucretli -> buyuk-context isler buraya
+        # 1M token context; Tier 1 paid -> large-context tasks go here
         "max_input_chars": 1_500_000,
     },
     "groq": {
@@ -40,8 +40,8 @@ PROVIDERS = {
         "key_env": ["GROQ_API_KEY"],
         "default_model": "openai/gpt-oss-120b",
         "light_model": "openai/gpt-oss-20b",
-        # ucretsiz katman model basina 8K token/dk (girdi+cikti); ~3-4K token girdi
-        # paralel islerin ayni dakikaya sigmasini saglar -> kucuk isler
+        # free tier 8K tokens/min per model (input+output); ~3-4K token input
+        # ensures parallel jobs fit within the same minute -> small tasks
         "max_input_chars": 12_000,
     },
     "openrouter": {
@@ -55,9 +55,9 @@ PROVIDERS = {
 }
 
 DEFAULT_ROLES = {
-    # Sistem promptlari Ingilizce: Turkce prompt, gorev Ingilizce olsa bile modeli
-    # Turkceye ve promptun formatina cekiyordu (olculdu). Format varsayilandir,
-    # gorev baska bir sey isterse gorev kazanir.
+    # System prompts are in English: Turkish prompts pulled the model towards
+    # Turkish and the prompt's format even when the task was in English (measured). Format is default,
+    # if the task requests something else, the task wins.
     "researcher":  {"provider": "gemini", "model": "gemini-3.6-flash", "whole_files": True,
                     "system": "You are a research analyst. Read the given source carefully and answer only from facts stated in it. Write 'unclear' where you are not sure. Default format: short bullets with numbered citations."},
     "summarizer":  {"provider": "groq", "model": "openai/gpt-oss-120b", "whole_files": True,
@@ -75,16 +75,16 @@ DEFAULT_ROLES = {
                     "system": "Extract the requested fields from the text and return them as valid JSON. Use null for missing fields. Output nothing but JSON."},
 }
 
-# Groq ucretsiz ve genis kotali; Gemini (Tier 1, ucretli) buyuk-context isler icin;
-# OpenRouter ucretsiz ama gunde ~50 istek -> en son.
+# Groq is free with a large quota; Gemini (Tier 1, paid) is for large-context tasks;
+# OpenRouter is free but ~50 requests/day -> last.
 FALLBACK_ORDER = ["groq", "gemini", "openrouter"]
 
 
-# whole_files: fanout'ta dosya parcalanmaz. Parca baglamsiz kalinca ozet/inceleme
-# uyduruyor (olculdu: Engine.cs parcalarinda olmayan metot adlari). Groq'a sigmayan
-# dosya butun olarak buyuk-context saglayiciya duser.
+# whole_files: file is not split in fanout. When a chunk is out of context, summary/review
+# hallucinates (measured: non-existent method names in Engine.cs chunks). Files that don't fit in Groq
+# fall back as a whole to the large-context provider.
 
-# Bu kural olmadan model girdi verisinin (orn. Turkce kod yorumlari) diline kayiyor.
+# Without this rule, the model drifts to the language of the input data (e.g., Turkish code comments).
 LANGUAGE_RULE = ("Unless the task explicitly asks for a different output language, "
                  "reply in the language the TASK instruction is written in - not the "
                  "language of the input data or of this system prompt. If the task asks "
@@ -135,7 +135,7 @@ RATELIMIT_SNAPSHOT = os.path.join(CONFIG_DIR, "ratelimit.json")
 
 
 def _rl_from_headers(h):
-    """Groq/OpenAI-uyumlu rate-limit header'larini ayikla."""
+    """Extract Groq/OpenAI-compatible rate-limit headers."""
     out = {}
     for k, v in (h or {}).items():
         kl = k.lower()
@@ -148,7 +148,7 @@ _record_lock = threading.Lock()
 
 
 def _record(provider, model, role, res, headers):
-    """Ledger'a bir satir ekle ve saglayicinin son rate-limit durumunu sakla."""
+    """Append a line to the ledger and store the provider's latest rate-limit status."""
     with _record_lock:
         _record_unlocked(provider, model, role, res, headers)
 
@@ -176,11 +176,11 @@ def _record_unlocked(provider, model, role, res, headers):
             with open(RATELIMIT_SNAPSHOT, "w") as f:
                 json.dump(snap, f, indent=2)
     except Exception:
-        pass  # olcum asla isi bozmaz
+        pass  # measurement should never break execution
 
 
 def _retry_delay(headers, attempt):
-    """Saglayicinin Retry-After degerine uy (Groq TPM limitinde saniyeler mertebesinde)."""
+    """Respect the provider's Retry-After value (on the order of seconds for Groq TPM limit)."""
     try:
         ra = float((headers or {}).get("retry-after"))
         return max(0.5, min(ra + 0.5, 60))
@@ -190,24 +190,24 @@ def _retry_delay(headers, attempt):
 
 def chat(provider, prompt, system=None, model=None, max_tokens=4096,
          temperature=0.2, retries=4, timeout=180, role=None):
-    """Tek bir worker cagrisi. Rate-limit/5xx durumunda geri cekilerek tekrar dener.
+    """Single worker call. Backs off and retries on rate-limit/5xx conditions.
 
-    Asla exception atmaz: anahtar yoksa, saglayici bilinmiyorsa veya girdi saglayicinin
-    butcesini asiyorsa ag cagrisi yapmadan {"ok": False, "skipped": True} doner ki
-    fallback bir sonrakine gecebilsin.
+    Never raises an exception: if no key, unknown provider, or input exceeds provider
+    budget, returns {"ok": False, "skipped": True} without making a network call so
+    fallback can move to the next one.
     """
     if provider not in PROVIDERS:
         return {"ok": False, "skipped": True, "provider": provider, "model": model,
-                "error": f"bilinmeyen saglayici: {provider}"}
+                "error": f"unknown provider: {provider}"}
     cfg = PROVIDERS[provider]
     key = api_key(provider)
     if not key:
         return {"ok": False, "skipped": True, "provider": provider, "model": model,
-                "error": f"anahtar yok ({ENV_FILE} -> {cfg['key_env'][0]}=...)"}
+                "error": f"missing key ({ENV_FILE} -> {cfg['key_env'][0]}=...)"}
     size = len(prompt) + len(system or "")
     if size > cfg["max_input_chars"]:
         return {"ok": False, "skipped": True, "provider": provider, "model": model,
-                "error": f"girdi cok buyuk: {size} karakter > {provider} siniri "
+                "error": f"input too large: {size} characters > {provider} limit "
                          f"{cfg['max_input_chars']}"}
     msgs = ([{"role": "system", "content": system}] if system else []) + \
            [{"role": "user", "content": prompt}]
@@ -222,10 +222,10 @@ def chat(provider, prompt, system=None, model=None, max_tokens=4096,
         try:
             data, hdrs = _post(cfg["url"], key, payload, timeout)
             if data.get("error") and not data.get("choices"):
-                # OpenRouter bazi upstream hatalarini HTTP 200 govdesinde dondurur
+                # OpenRouter returns some upstream errors in the HTTP 200 body
                 err = data["error"]
                 code = err.get("code") if isinstance(err, dict) else None
-                last = f"HTTP 200 govde hatasi {code}: {json.dumps(err, ensure_ascii=False)[:600]}"
+                last = f"HTTP 200 body error {code}: {json.dumps(err, ensure_ascii=False)[:600]}"
                 if code in (408, 429, 500, 502, 503, 504) and attempt < retries - 1:
                     time.sleep(min(2 ** attempt * 2, 20))
                     continue
@@ -239,11 +239,11 @@ def chat(provider, prompt, system=None, model=None, max_tokens=4096,
                 "tokens": {"in": usage.get("prompt_tokens"), "out": usage.get("completion_tokens")},
                 "finish_reason": choice.get("finish_reason"),
                 "warning": (
-                    "Bos yanit: model dusunme adiminda token butcesini tuketti. "
-                    "max_tokens'i artir (reasoning modelleri icin >=512)."
+                    "Empty response: model exhausted token budget in thinking step. "
+                    "Increase max_tokens (>=512 for reasoning models)."
                     if not text.strip() and choice.get("finish_reason") == "length" else None
                 ),
-                # metin var ama max_tokens'ta kesildi -> cagiran eksik cikti oldugunu bilmeli
+                # text exists but was cut off at max_tokens -> caller should know output is truncated
                 "truncated": bool(text.strip()) and choice.get("finish_reason") == "length",
             }
             _record(provider, payload["model"], role, res, hdrs)
@@ -255,7 +255,7 @@ def chat(provider, prompt, system=None, model=None, max_tokens=4096,
                 time.sleep(_retry_delay(e.headers, attempt))
                 continue
             break
-        except Exception as e:  # ag hatasi / timeout
+        except Exception as e:  # network error / timeout
             last = f"{type(e).__name__}: {e}"
             if attempt < retries - 1:
                 time.sleep(min(2 ** attempt * 2, 20))
@@ -267,7 +267,7 @@ def chat(provider, prompt, system=None, model=None, max_tokens=4096,
 
 
 def chat_with_fallback(providers, prompt, **kw):
-    """Sirayla dene; ilk basarili yaniti dondur. Hangi saglayicilarin dustugunu raporla."""
+    """Try in order; return the first successful response. Report which providers failed."""
     tried = []
     for p in providers:
         res = chat(p, prompt, **kw)
@@ -276,16 +276,16 @@ def chat_with_fallback(providers, prompt, **kw):
                 res["fallback_from"] = tried
             return res
         tried.append({"provider": p, "error": res["error"]})
-    return {"ok": False, "error": "tum saglayicilar basarisiz", "tried": tried}
+    return {"ok": False, "error": "all providers failed", "tried": tried}
 
 
 def key_info(provider):
-    """Saglayicinin kendi kota endpoint'i varsa canli veriyi getir."""
+    """Fetch live data if the provider has its own quota endpoint."""
     key = api_key(provider)
     if not key:
-        return {"ok": False, "error": "anahtar yok"}
+        return {"ok": False, "error": "missing key"}
     if provider != "openrouter":
-        return {"ok": False, "error": "bu saglayici kota endpoint'i sunmuyor"}
+        return {"ok": False, "error": "this provider does not offer a quota endpoint"}
     req = urllib.request.Request("https://openrouter.ai/api/v1/key",
                                  headers={"Authorization": f"Bearer {key}", "User-Agent": UA})
     try:
@@ -298,7 +298,7 @@ def key_info(provider):
 def list_models(provider, free_only=False):
     key = api_key(provider)
     if not key:
-        return {"ok": False, "error": "anahtar yok"}
+        return {"ok": False, "error": "missing key"}
     url = PROVIDERS[provider]["models_url"]
     req = urllib.request.Request(
         url, headers={"Authorization": f"Bearer {key}", "User-Agent": UA,

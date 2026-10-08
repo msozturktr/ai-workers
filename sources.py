@@ -1,17 +1,17 @@
-"""Iscilere dosya besleme: yol/glob cozumleme, gizli dosya filtresi, parcalama.
+"""Feeding files to workers: path/glob resolution, secret file filter, chunking.
 
-Amac: Claude dosya icerigini kendi context'ine yuklemeden sadece yol versin;
-icerigi sunucu okuyup isciye iletsin.
+Purpose: Allow Claude to provide only paths without loading file contents into its own context;
+the server reads the content and forwards it to the worker.
 """
 import fnmatch, glob, os
 
 HOME = os.path.expanduser("~")
 
-# Dizin taramalarinda atlanan uretim/arac klasorleri
+# Build/tool directories skipped in directory scans
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".godot", ".import", ".next",
              ".venv", "venv", "obj", "bin", ".mypy_cache", ".pytest_cache"}
 
-# Asla disari gonderilmeyen dosyalar (anahtar, parola, kimlik bilgisi)
+# Files that are never sent out (key, password, credential)
 SECRET_NAMES = [".env", ".env.*", "*.env", "*.pem", "*.key", "*.p12", "*.pfx", "*.kdbx",
                 "id_rsa*", "id_ed25519*", "id_ecdsa*", "id_dsa*", "*.keystore", "*.jks",
                 ".netrc", ".npmrc", ".pypirc", "credentials*", "*secret*", "*.gpg",
@@ -37,9 +37,9 @@ def _skipped_dir(path):
 
 
 def resolve(patterns):
-    """Yol/glob listesini dosya listesine cevirir.
+    """Converts path/glob list to file list.
 
-    Doner: (dosyalar, atlananlar[{path, reason}], hata|None)
+    Returns: (files, skipped[{path, reason}], error|None)
     """
     if isinstance(patterns, str):
         patterns = [patterns]
@@ -47,34 +47,34 @@ def resolve(patterns):
     for pat in patterns or []:
         p = os.path.expanduser(pat)
         if not os.path.isabs(p):
-            return [], skipped, f"mutlak yol gerekli (veya ~ ile): {pat}"
+            return [], skipped, f"absolute path required (or with ~): {pat}"
         if os.path.isdir(p):
             p = os.path.join(p, "**", "*")
-        expanded = glob.has_magic(p)  # glob ya da dizin -> arac klasorlerini atla
+        expanded = glob.has_magic(p)  # glob or directory -> skip tool directories
         matches = sorted(glob.glob(p, recursive=True)) if expanded else [p]
         if not matches:
-            skipped.append({"path": pat, "reason": "eslesen dosya yok"})
+            skipped.append({"path": pat, "reason": "no matching files"})
         for m in matches:
             if m in seen or os.path.isdir(m):
                 continue
             seen.add(m)
             if not os.path.exists(m):
-                skipped.append({"path": m, "reason": "yok"})
+                skipped.append({"path": m, "reason": "does not exist"})
             elif expanded and _skipped_dir(m):
-                continue  # node_modules vb. sessizce atla
+                continue  # silently skip node_modules etc.
             elif _is_secret(m):
-                skipped.append({"path": m, "reason": "gizli dosya (gonderilmez)"})
+                skipped.append({"path": m, "reason": "secret file (not sent)"})
             elif os.path.getsize(m) > MAX_FILE_BYTES:
                 skipped.append({"path": m, "reason": f"> {MAX_FILE_BYTES // 1_000_000} MB"})
             else:
                 files.append(m)
             if len(files) > MAX_FILES:
-                return [], skipped, f"cok fazla dosya (> {MAX_FILES}); glob'u daralt"
+                return [], skipped, f"too many files (> {MAX_FILES}); narrow the glob"
     return files, skipped, None
 
 
 def read_text(path):
-    """Metin dosyasini oku; ikili ise None."""
+    """Read text file; None if binary."""
     with open(path, "rb") as f:
         raw = f.read()
     if b"\x00" in raw[:8192]:
@@ -83,12 +83,12 @@ def read_text(path):
 
 
 def chunk(text, size):
-    """Metni satir sinirlarinda en fazla `size` karakterlik parcalara bol."""
+    """Split text into chunks of at most `size` characters at line boundaries."""
     if len(text) <= size:
         return [text]
     parts, cur, cur_len = [], [], 0
     for line in text.splitlines(keepends=True):
-        while len(line) > size:  # tek satir siniri asiyorsa sert kes
+        while len(line) > size:  # hard split if a single line exceeds the limit
             if cur:
                 parts.append("".join(cur)); cur, cur_len = [], 0
             parts.append(line[:size]); line = line[size:]
@@ -113,9 +113,9 @@ def label(path, root):
 
 
 def bundle(patterns):
-    """delegate icin: tum dosyalari tek metinde birlestir.
+    """For delegate: combine all files into a single text.
 
-    Doner: (metin, dosya_sayisi, atlananlar, hata|None)
+    Returns: (text, file_count, skipped, error|None)
     """
     files, skipped, err = resolve(patterns)
     if err:
@@ -125,16 +125,16 @@ def bundle(patterns):
     for fp in files:
         text = read_text(fp)
         if text is None:
-            skipped.append({"path": fp, "reason": "ikili dosya"})
+            skipped.append({"path": fp, "reason": "binary file"})
             continue
-        blocks.append(f"### DOSYA: {label(fp, root)}\n{text}")
+        blocks.append(f"### FILE: {label(fp, root)}\n{text}")
     return "\n\n".join(blocks), len(blocks), skipped, None
 
 
 def items(patterns, chunk_chars):
-    """fanout icin: her dosya (buyukse her parca) ayri is.
+    """For fanout: each file (or chunk if large) is a separate task.
 
-    Doner: (ogeler[{label, input}], atlananlar, hata|None)
+    Returns: (items[{label, input}], skipped, error|None)
     """
     files, skipped, err = resolve(patterns)
     if err:
@@ -144,13 +144,13 @@ def items(patterns, chunk_chars):
     for fp in files:
         text = read_text(fp)
         if text is None:
-            skipped.append({"path": fp, "reason": "ikili dosya"})
+            skipped.append({"path": fp, "reason": "binary file"})
             continue
         name = label(fp, root)
         parts = chunk(text, chunk_chars)
         for i, part in enumerate(parts, 1):
             lab = name if len(parts) == 1 else f"{name} [{i}/{len(parts)}]"
-            out.append({"label": lab, "input": f"### DOSYA: {lab}\n{part}"})
+            out.append({"label": lab, "input": f"### FILE: {lab}\n{part}"})
     return out, skipped, None
 
 
@@ -159,5 +159,5 @@ def format_skipped(skipped, limit=15):
         return ""
     lines = [f"- {s['path']}: {s['reason']}" for s in skipped[:limit]]
     if len(skipped) > limit:
-        lines.append(f"- ... +{len(skipped) - limit} dosya daha")
-    return "\n## Atlanan dosyalar\n" + "\n".join(lines)
+        lines.append(f"- ... +{len(skipped) - limit} more files")
+    return "\n## Skipped files\n" + "\n".join(lines)

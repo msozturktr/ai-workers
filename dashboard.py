@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Kalan kullanim panosu. Yerel, sadece 127.0.0.1'e baglanir.
+"""Remaining usage dashboard. Local, binds only to 127.0.0.1.
 
   python3 dashboard.py [--port 8765] [--once]
 """
@@ -15,7 +15,7 @@ PAGE = os.path.join(HERE, "dashboard.html")
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
-        pass  # terminali kirletme
+        pass  # do not clutter the terminal
 
     def _send(self, code, body, ctype):
         self.send_response(code)
@@ -38,24 +38,24 @@ class Handler(BaseHTTPRequestHandler):
                 with open(PAGE, "rb") as f:
                     return self._send(200, f.read(), "text/html; charset=utf-8")
             except FileNotFoundError:
-                return self._send(500, b"dashboard.html bulunamadi", "text/plain")
-        self._send(404, b"yok", "text/plain; charset=utf-8")
+                return self._send(500, b"dashboard.html not found", "text/plain")
+        self._send(404, b"not found", "text/plain; charset=utf-8")
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8765)
-    ap.add_argument("--once", action="store_true", help="sunucu acmadan JSON bas")
+    ap.add_argument("--once", action="store_true", help="print JSON without starting the server")
     a = ap.parse_args()
     if a.once:
         print(json.dumps(usage.snapshot(), indent=2, ensure_ascii=False))
         return
     srv = ThreadingHTTPServer(("127.0.0.1", a.port), Handler)
-    print(f"ai-workers panosu -> http://127.0.0.1:{a.port}  (Ctrl+C ile kapat)")
+    print(f"ai-workers dashboard -> http://127.0.0.1:{a.port}  (Ctrl+C to stop)")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
-        print("\nkapatildi")
+        print("\nstopped")
 
 
 if __name__ == "__main__":

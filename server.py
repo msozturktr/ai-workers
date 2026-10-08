@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""ai-workers: ucretsiz API modellerini Claude Code'a worker tool'u olarak acan MCP server.
+"""ai-workers: MCP server that exposes free API models to Claude Code as worker tools.
 
-Stdio uzerinden JSON-RPC. Harici bagimlilik yok.
+JSON-RPC over stdio. No external dependencies.
 """
 import json, os, sys, threading, traceback
 from concurrent.futures import ThreadPoolExecutor
@@ -12,61 +12,61 @@ import usage as U
 import sources as S
 
 PROTOCOL = "2025-06-18"
-SERVER = {"name": "ai-workers", "version": "1.1.0"}
+SERVER = {"name": "ai-workers", "version": "1.2.0"}
 
-INSTRUCTIONS = """ai-workers: Claude'un token'ini korumak icin isci model havuzu (Groq/OpenRouter ucretsiz, Gemini buyuk-context).
-Varsayilan: mekanik isi kendin yapma, isciye ver -> toplu ozet, ceviri, siniflandirma/etiketleme, log ve cikti tarama, buyuk dosya/dizin ozeti, dosya basina tekrarli analiz, taslak metin, regex/veri donusturme, boilerplate taslagi.
-ICERIGI YAPISTIRMA: dosya uzerinde is varsa `files` parametresine MUTLAK yol/glob/dizin ver (orn. ["~/Projeler/gripsim/scripts/**/*.cs"]). Sunucu dosyayi kendisi okur, icerik senin context'ine hic girmez; sana sadece isci ciktisi doner. Bir dosyayi once Read edip sonra input'a kopyalamak token israfidir.
-Tek is -> delegate. N dosya / N parca -> fanout (files ile her dosya ayri is olur; buyuk dosyalar otomatik parcalanir, Groq sinirini asan girdi otomatik Gemini'ye duser).
-Gizli dosyalar (.env, anahtarlar, ~/.ssh ...) otomatik atlanir. Isci ciktisi dogrulanmamis taslaktir: kritik noktada kontrol et. Mimari karar, kritik kod duzenlemesi, guvenlik/veri kaybi riski olan isler sende kalir.
-Komut ciktisi (log, test ciktisi) taranacaksa once scratchpad'e dosyaya yaz, sonra files ile ver."""
+INSTRUCTIONS = """ai-workers: worker model pool to save Claude's tokens (Groq/OpenRouter free, Gemini large-context).
+Default: don't do mechanical work yourself, delegate to worker -> bulk summary, translation, classification/labeling, log and output scanning, large file/directory summary, per-file repetitive analysis, draft text, regex/data transformation, boilerplate draft.
+DO NOT PASTE CONTENT: if working on files, pass ABSOLUTE path/glob/directory to the `files` parameter (e.g. ["~/code/myapp/src/**/*.py"]). The server reads the file itself; content never enters your context; you only receive the worker output. Reading a file first and then copying it to input is a waste of tokens.
+Single job -> delegate. N files / N chunks -> fanout (with files, each file becomes a separate job; large files are automatically chunked, inputs exceeding Groq limit automatically fallback to Gemini).
+Secret files (.env, keys, ~/.ssh ...) are automatically skipped. Worker output is an unverified draft: verify at critical points. Architectural decisions, critical code edits, tasks with security/data loss risks remain with you.
+If scanning command output (log, test output), write to a file in scratchpad first, then pass via files."""
 
 ALWAYS = {"anthropic/alwaysLoad": True}
 
 TOOLS = [
     {
         "name": "org_status",
-        "description": "Organizasyonun durumu: hangi saglayicilarda anahtar var, hangi roller tanimli, her rol hangi model. Ilk is olarak veya bir worker hata verdiginde cagir.",
+        "description": "Organization status: which providers have keys, which roles are defined, which model each role uses. Call as first step or when a worker errors out.",
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
         "name": "delegate",
-        "description": "Tek bir isi isci modele devret (rol = saglayici + model + sistem promptu). Dosya uzerinde is icin icerigi yapistirma: `files` ile mutlak yol/glob ver, sunucu kendisi okur (token tasarrufu). Rolun saglayicisi hata verir ya da girdi sinirini asarsa digerlerine otomatik gecer. Cok is/cok dosya varsa fanout kullan.",
+        "description": "Delegate a single task to a worker model (role = provider + model + system prompt). Do not paste content for file work: provide absolute path/glob via `files`, server reads it directly (saves tokens). If the role's provider errors or exceeds input limit, automatically falls back to others. Use fanout if there are many tasks/files.",
         "_meta": ALWAYS,
         "inputSchema": {
             "type": "object",
             "properties": {
-                "role": {"type": "string", "description": "org_status'tan bir rol adi: researcher, summarizer, coder, reviewer, translator, classifier, extractor"},
-                "task": {"type": "string", "description": "Isci icin net talimat. Ne istedigini ve cikti formatini acikca yaz."},
-                "input": {"type": "string", "description": "Uzerinde calisilacak kisa veri/metin (opsiyonel). Dosya icerigi icin bunun yerine files kullan."},
+                "role": {"type": "string", "description": "A role name from org_status: researcher, summarizer, coder, reviewer, translator, classifier, extractor"},
+                "task": {"type": "string", "description": "Clear instruction for the worker. State clearly what you want and the output format."},
+                "input": {"type": "string", "description": "Short data/text to work on (optional). Use files instead of this for file content."},
                 "files": {"type": "array", "items": {"type": "string"},
-                          "description": "Mutlak dosya yolu, dizin veya glob listesi (~ olur). Sunucu okur ve hepsini tek girdi olarak isciye verir. Gizli/ikili dosyalar atlanir."},
-                "model": {"type": "string", "description": "Rolun varsayilan modelini ez (opsiyonel)."},
-                "max_tokens": {"type": "integer", "description": "Varsayilan 4096."},
-                "no_fallback": {"type": "boolean", "description": "true ise sadece rolun kendi saglayicisini dener."},
+                          "description": "List of absolute file paths, directories, or globs (~ supported). Server reads and passes all as a single input to the worker. Secret/binary files are skipped."},
+                "model": {"type": "string", "description": "Override default model of the role (optional)."},
+                "max_tokens": {"type": "integer", "description": "Default 4096."},
+                "no_fallback": {"type": "boolean", "description": "If true, only tries the role's own provider."},
             },
             "required": ["role", "task"],
         },
     },
     {
         "name": "fanout",
-        "description": "Isleri paralel olarak isci havuzuna dagit. Toplu ozetleme, ceviri, siniflandirma, dosya basina analiz gibi N parcali isler icin bunu kullan - tek tek delegate cagirma. `files` verirsen her dosya ayri is olur (buyuk dosya otomatik parcalanir); icerik senin context'ine girmez.",
+        "description": "Distribute tasks in parallel to worker pool. Use this for N-part jobs like bulk summarization, translation, classification, per-file analysis - do not call delegate one by one. If `files` is given, each file becomes a separate job (large files automatically chunked); content does not enter your context.",
         "_meta": ALWAYS,
         "inputSchema": {
             "type": "object",
             "properties": {
-                "role": {"type": "string", "description": "Tum isler icin varsayilan rol."},
-                "task": {"type": "string", "description": "Tum isler icin varsayilan talimat."},
+                "role": {"type": "string", "description": "Default role for all tasks."},
+                "task": {"type": "string", "description": "Default instruction for all tasks."},
                 "items": {
                     "type": "array",
-                    "description": "Is listesi. Her oge ya duz metin (input olarak kullanilir) ya da {input, task?, role?, model?, label?} nesnesi.",
+                    "description": "Task list. Each item is either plain text (used as input) or a {input, task?, role?, model?, label?} object.",
                     "items": {"type": ["string", "object"]},
                 },
                 "files": {"type": "array", "items": {"type": "string"},
-                          "description": "Mutlak yol/dizin/glob listesi. Her dosya (ya da buyuk dosyanin her parcasi) ortak role+task ile ayri is olur. items ile birlikte kullanilabilir."},
-                "chunk_chars": {"type": "integer", "description": "files icin parca boyu (karakter). Varsayilan: rolun saglayici sinirina gore (Groq ~11K, Gemini 200K)."},
-                "whole_files": {"type": "boolean", "description": "true: dosyalari parcalama, butun gonder (Groq'a sigmayan Gemini'ye duser). summarizer/researcher/reviewer'da varsayilan true; parca baglamsiz kalinca ozet uyduruyor."},
-                "concurrency": {"type": "integer", "description": "Es zamanli istek sayisi. Ucretsiz katman rate-limitleri icin varsayilan 4; Groq'ta 8'e kadar cikilabilir."},
+                          "description": "List of absolute paths/directories/globs. Each file (or chunk of a large file) becomes a separate task with shared role+task. Can be used together with items."},
+                "chunk_chars": {"type": "integer", "description": "Chunk size for files (characters). Default: based on role's provider limit (Groq ~11K, Gemini 200K)."},
+                "whole_files": {"type": "boolean", "description": "true: do not chunk files, send whole (files exceeding Groq fallback to Gemini). Default is true in summarizer/researcher/reviewer; out-of-context chunks hallucinate summaries."},
+                "concurrency": {"type": "integer", "description": "Number of concurrent requests. Default 4 for free tier rate-limits; can go up to 8 on Groq."},
                 "max_tokens": {"type": "integer"},
             },
             "required": [],
@@ -74,13 +74,13 @@ TOOLS = [
     },
     {
         "name": "usage",
-        "_meta": {"anthropic/searchHint": "ai-workers kota kalan kullanim limit"},
-        "description": "Kalan kullanim raporu: her saglayicinin kotasi (Groq/OpenRouter canli, Gemini yerel sayac) ve Claude tarafinin bugunku token tuketimi. Toplu bir fanout baslatmadan once veya kullanici 'ne kadar kaldi' diye sordugunda cagir.",
+        "_meta": {"anthropic/searchHint": "ai-workers quota remaining usage limit"},
+        "description": "Remaining usage report: quotas for each provider (Groq/OpenRouter live, Gemini local counter) and today's token consumption on Claude side. Call before starting a bulk fanout or when user asks 'how much is left'.",
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
         "name": "ask",
-        "description": "Belirli bir saglayici/modele dogrudan tek cagri. Rol soyutlamasini atlamak, yeni bir model denemek veya model karsilastirmasi yapmak icin.",
+        "description": "Direct single call to a specific provider/model. Use to bypass role abstraction, try a new model, or perform model comparison.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -96,12 +96,12 @@ TOOLS = [
     },
     {
         "name": "models",
-        "description": "Bir saglayicinin canli model listesini cek. Model adlari degistiginde (ucretsiz katmanlar sik degisir) gercek listeyi buradan dogrula, tahmin etme.",
+        "description": "Fetch live model list of a provider. When model names change (free tiers change frequently), verify the actual list here, do not guess.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "provider": {"type": "string", "enum": ["gemini", "groq", "openrouter"]},
-                "free_only": {"type": "boolean", "description": "Sadece openrouter icin anlamli: ':free' ile bitenleri filtreler."},
+                "free_only": {"type": "boolean", "description": "Only meaningful for openrouter: filters models ending with ':free'."},
             },
             "required": ["provider"],
         },
@@ -120,18 +120,18 @@ def _roles():
 def t_org_status(_a):
     roles = _roles()
     have = P.available_providers()
-    lines = ["# ai-workers organizasyon durumu", "", "## Saglayicilar"]
+    lines = ["# ai-workers organization status", "", "## Providers"]
     for name, cfg in P.PROVIDERS.items():
-        mark = "HAZIR" if name in have else "ANAHTAR YOK"
-        lines.append(f"- {name}: {mark} (varsayilan: {cfg['default_model']}, hafif: {cfg['light_model']})")
+        mark = "READY" if name in have else "NO KEY"
+        lines.append(f"- {name}: {mark} (default: {cfg['default_model']}, light: {cfg['light_model']})")
     if not have:
-        lines += ["", f"Hicbir anahtar yok. {P.ENV_FILE} dosyasina ekle:",
+        lines += ["", f"No keys found. Add to {P.ENV_FILE} file:",
                   "  GEMINI_API_KEY=...", "  GROQ_API_KEY=...", "  OPENROUTER_API_KEY=..."]
-    lines += ["", "## Roller"]
+    lines += ["", "## Roles"]
     for name, spec in roles.items():
-        ready = "" if spec["provider"] in have else "  [saglayicisi hazir degil -> fallback kullanilir]"
+        ready = "" if spec["provider"] in have else "  [provider not ready -> fallback will be used]"
         lines.append(f"- {name}: {spec['provider']} / {spec['model']}{ready}")
-    lines += ["", f"Rolleri duzenlemek icin: {P.CONFIG_FILE}"]
+    lines += ["", f"To edit roles: {P.CONFIG_FILE}"]
     return "\n".join(lines)
 
 
@@ -139,7 +139,7 @@ def t_delegate(a):
     roles = _roles()
     role = a["role"]
     if role not in roles:
-        return f"HATA: '{role}' rolu yok. Mevcut roller: {', '.join(roles)}"
+        return f"ERROR: role '{role}' does not exist. Available roles: {', '.join(roles)}"
     spec = roles[role]
     kw = dict(system=spec.get("system"), model=a.get("model") or spec.get("model"),
               max_tokens=a.get("max_tokens", 4096), role=role)
@@ -147,16 +147,16 @@ def t_delegate(a):
     if a.get("files"):
         text, nfiles, skipped, err = S.bundle(a["files"])
         if err:
-            return f"HATA: {err}"
+            return f"ERROR: {err}"
         if not nfiles:
-            return "HATA: okunabilir dosya yok" + S.format_skipped(skipped)
+            return "ERROR: no readable files" + S.format_skipped(skipped)
         data = f"{data}\n\n{text}" if data else text
     prompt = _compose(a["task"], data)
     if a.get("no_fallback"):
         res = P.chat(spec["provider"], prompt, **kw)
     else:
         order = [spec["provider"]] + [p for p in P.FALLBACK_ORDER if p != spec["provider"]]
-        # fallback'te rolun modeli gecersiz kalir; saglayicinin varsayilanina birak
+        # in fallback, role's model becomes invalid; leave it to provider's default
         res = P.chat(spec["provider"], prompt, **kw)
         if not res["ok"]:
             kw.pop("model")
@@ -165,22 +165,22 @@ def t_delegate(a):
                 res2["fallback_from"] = [{"provider": spec["provider"], "error": res["error"]}]
                 res = res2
     if not res.get("ok"):
-        return ("WORKER BASARISIZ\n" + json.dumps(res, ensure_ascii=False, indent=2)
+        return ("WORKER FAILED\n" + json.dumps(res, ensure_ascii=False, indent=2)
                 + S.format_skipped(skipped))
     if res.get("warning"):
-        return f"UYARI: {res['warning']}"
+        return f"WARNING: {res['warning']}"
     if res.get("truncated"):
         res["text"] += _TRUNC_NOTE
     head = f"[{role} -> {res['provider']}/{res['model']}"
     if nfiles:
-        head += f", {nfiles} dosya {len(prompt) // 1000}K kar."
+        head += f", {nfiles} files {len(prompt) // 1000}K chars."
     head += "]"
     if res.get("fallback_from"):
         head += f" (fallback: {_fb_summary(res['fallback_from'])})"
     return f"{head}\n\n{res['text']}" + S.format_skipped(skipped)
 
 
-_TRUNC_NOTE = "\n\n[UYARI: yanit max_tokens sinirinda KESILDI - eksik; max_tokens'i artirip tekrar dene]"
+_TRUNC_NOTE = "\n\n[WARNING: response TRUNCATED at max_tokens limit - incomplete; increase max_tokens and try again]"
 
 
 def _fb_summary(fb):
@@ -201,27 +201,27 @@ def t_fanout(a):
     skipped = []
     if a.get("files"):
         if default_role not in roles or not default_task:
-            return "HATA: files ile ortak 'role' (gecerli) ve 'task' gerekli."
+            return "ERROR: shared 'role' (valid) and 'task' are required with files."
         prov = P.PROVIDERS.get(roles[default_role]["provider"]) or {}
         budget = prov.get("max_input_chars", 200_000) - len(default_task) \
             - len(roles[default_role].get("system") or "") - 500
         whole = a.get("whole_files", roles[default_role].get("whole_files", False))
         if whole:
-            # parcalama yok: en buyuk butceli saglayiciya sigacak kadar (fallback oraya duser)
+            # no chunking: fit into the provider with the largest budget (fallback falls there)
             biggest = max(c["max_input_chars"] for c in P.PROVIDERS.values())
             size = int(a.get("chunk_chars") or biggest - len(default_task) - 2000)
         else:
             size = int(a.get("chunk_chars") or min(max(budget, 4000), 200_000))
         file_items, skipped, err = S.items(a["files"], size)
         if err:
-            return f"HATA: {err}"
+            return f"ERROR: {err}"
         items += file_items
     if not items:
-        return "HATA: is yok (items bos ve files hicbir okunabilir dosyayla eslesmedi)" \
+        return "ERROR: no jobs (items is empty and files matched no readable files)" \
             + S.format_skipped(skipped)
     if len(items) > MAX_JOBS:
-        return (f"HATA: {len(items)} is > {MAX_JOBS}. Glob'u daralt veya chunk_chars'i buyut "
-                "(gunluk kotalari bir cagrida tuketmemek icin).")
+        return (f"ERROR: {len(items)} jobs > {MAX_JOBS}. Narrow glob or increase chunk_chars "
+                "(to avoid exhausting daily quotas in a single call).")
 
     jobs = []
     for i, it in enumerate(items):
@@ -230,16 +230,16 @@ def t_fanout(a):
         role = it.get("role") or default_role
         task = it.get("task") or default_task
         if not role or not task:
-            return "HATA: her is icin bir rol ve bir task gerekli (ya ortak 'role'/'task' ver ya da oge icinde belirt)."
+            return "ERROR: role and task are required for each job (either provide shared 'role'/'task' or specify per item)."
         if role not in roles:
-            return f"HATA: '{role}' rolu yok. Mevcut roller: {', '.join(roles)}"
+            return f"ERROR: role '{role}' does not exist. Available roles: {', '.join(roles)}"
         jobs.append({"idx": i, "label": it.get("label") or f"#{i+1}", "role": role,
                      "task": task, "input": it.get("input"), "model": it.get("model")})
 
     def run(j):
         try:
             return run_job(j)
-        except Exception as e:  # tek isin hatasi tum fanout'u dusurmesin
+        except Exception as e:  # exception in a single job should not crash the entire fanout
             return j, {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
     def run_job(j):
@@ -265,16 +265,16 @@ def t_fanout(a):
         results = list(ex.map(run, jobs))
 
     ok = sum(1 for _, r in results if r.get("ok"))
-    out = [f"# fanout: {ok}/{len(results)} basarili (concurrency={conc})"]
+    out = [f"# fanout: {ok}/{len(results)} successful (concurrency={conc})"]
     for j, r in sorted(results, key=lambda x: x[0]["idx"]):
         if r.get("ok"):
             fb = f" fallback<-{r['fallback_from']}" if r.get("fallback_from") else ""
-            body = (r["text"] or "(bos yanit)") + (_TRUNC_NOTE if r.get("truncated") else "")
+            body = (r["text"] or "(empty response)") + (_TRUNC_NOTE if r.get("truncated") else "")
             if r.get("warning"):
-                body = f"UYARI: {r['warning']}"
+                body = f"WARNING: {r['warning']}"
             out.append(f"\n## {j['label']} [{j['role']} -> {r['provider']}/{r['model']}{fb}]\n{body}")
         else:
-            out.append(f"\n## {j['label']} [BASARISIZ]\n{r.get('error') or r.get('tried')}")
+            out.append(f"\n## {j['label']} [FAILED]\n{r.get('error') or r.get('tried')}")
     return "\n".join(out) + S.format_skipped(skipped)
 
 
@@ -282,8 +282,8 @@ def t_ask(a):
     res = P.chat(a["provider"], a["prompt"], system=a.get("system"), model=a.get("model"),
                  max_tokens=a.get("max_tokens", 4096), temperature=a.get("temperature", 0.2))
     if not res["ok"]:
-        return "BASARISIZ\n" + json.dumps(res, ensure_ascii=False, indent=2)
-    warn = f"\nUYARI: {res['warning']}" if res.get("warning") else ""
+        return "FAILED\n" + json.dumps(res, ensure_ascii=False, indent=2)
+    warn = f"\nWARNING: {res['warning']}" if res.get("warning") else ""
     trunc = _TRUNC_NOTE if res.get("truncated") else ""
     return f"[{res['provider']}/{res['model']} tokens={res['tokens']}]{warn}\n\n{res['text']}{trunc}"
 
@@ -291,8 +291,8 @@ def t_ask(a):
 def t_models(a):
     r = P.list_models(a["provider"], a.get("free_only", False))
     if not r.get("ok"):
-        return f"BASARISIZ: {r.get('error')}"
-    return f"{r['provider']}: {r['count']} model\n" + "\n".join(f"- {m}" for m in r["models"])
+        return f"FAILED: {r.get('error')}"
+    return f"{r['provider']}: {r['count']} models\n" + "\n".join(f"- {m}" for m in r["models"])
 
 
 def t_usage(_a):
@@ -314,14 +314,14 @@ def send(obj):
 
 
 def _call_tool(mid, fn, args):
-    """Tool'u ayri thread'de calistir: uzun fanout ping'i ve diger cagrilari bloklamasin."""
+    """Run tool in a separate thread: long fanout shouldn't block ping and other calls."""
     try:
         text = fn(args)
         send({"jsonrpc": "2.0", "id": mid,
               "result": {"content": [{"type": "text", "text": text}]}})
     except Exception:
         send({"jsonrpc": "2.0", "id": mid, "result": {
-            "content": [{"type": "text", "text": "SERVER HATASI\n" + traceback.format_exc()}],
+            "content": [{"type": "text", "text": "SERVER ERROR\n" + traceback.format_exc()}],
             "isError": True,
         }})
 
@@ -358,21 +358,21 @@ def main():
                 fn = HANDLERS.get(name)
                 if not fn:
                     send({"jsonrpc": "2.0", "id": mid,
-                          "error": {"code": -32602, "message": f"bilinmeyen tool: {name}"}})
+                          "error": {"code": -32602, "message": f"unknown tool: {name}"}})
                     continue
                 pool.submit(_call_tool, mid, fn, args)
             elif method and method.startswith("notifications/"):
                 continue
             elif mid is not None:
                 send({"jsonrpc": "2.0", "id": mid,
-                      "error": {"code": -32601, "message": f"desteklenmeyen method: {method}"}})
+                      "error": {"code": -32601, "message": f"unsupported method: {method}"}})
         except Exception:
             if mid is not None:
                 send({"jsonrpc": "2.0", "id": mid, "result": {
-                    "content": [{"type": "text", "text": "SERVER HATASI\n" + traceback.format_exc()}],
+                    "content": [{"type": "text", "text": "SERVER ERROR\n" + traceback.format_exc()}],
                     "isError": True,
                 }})
-    pool.shutdown(wait=True)  # stdin kapandi: suren isler bitsin
+    pool.shutdown(wait=True)  # stdin closed: finish ongoing jobs
 
 
 if __name__ == "__main__":

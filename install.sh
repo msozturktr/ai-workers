@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# ai-workers'i calistirilabilir uygulama olarak kurar:
-#   ~/.local/bin/ai-workers            komut
-#   systemd --user ai-workers.service  pano servisi (girislerde otomatik)
-#   ~/.local/share/applications/...    uygulama menusu kisayolu
+# Installs ai-workers as an executable application:
+#   ~/.local/bin/ai-workers            command
+#   systemd --user ai-workers.service  dashboard service (automatic on login)
+#   ~/.local/share/applications/...    application menu shortcut
 set -euo pipefail
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -13,15 +13,15 @@ PY_BIN="$(command -v python3)"
 
 mkdir -p "$BIN_DIR" "$UNIT_DIR" "$DESK_DIR"
 
-# 1) komut
+# 1) command
 cat > "$BIN_DIR/ai-workers" <<EOF
 #!/usr/bin/env bash
 exec "$PY_BIN" "$APP_DIR/cli.py" "\$@"
 EOF
 chmod +x "$BIN_DIR/ai-workers"
-echo "komut      : $BIN_DIR/ai-workers"
+echo "command  : $BIN_DIR/ai-workers"
 
-# 2) servis
+# 2) service
 cat > "$UNIT_DIR/ai-workers.service" <<EOF
 [Unit]
 Description=ai-workers kota panosu
@@ -34,7 +34,7 @@ ExecStart=$PY_BIN $APP_DIR/dashboard.py --port 8765
 WorkingDirectory=$APP_DIR
 Restart=on-failure
 RestartSec=5
-# yalnizca 127.0.0.1'e baglanir; disa acik degildir
+# binds only to 127.0.0.1; not exposed externally
 PrivateTmp=yes
 NoNewPrivileges=yes
 
@@ -44,15 +44,15 @@ EOF
 systemctl --user daemon-reload
 systemctl --user enable --now ai-workers.service >/dev/null 2>&1 || \
   systemctl --user restart ai-workers.service
-echo "servis     : $(systemctl --user is-active ai-workers.service) / $(systemctl --user is-enabled ai-workers.service 2>/dev/null || echo '?')"
+echo "service  : $(systemctl --user is-active ai-workers.service) / $(systemctl --user is-enabled ai-workers.service 2>/dev/null || echo '?')"
 
-# 3) menu kisayolu
+# 3) menu shortcut
 cat > "$DESK_DIR/ai-workers.desktop" <<EOF
 [Desktop Entry]
 Type=Application
 Name=ai-workers
-GenericName=Model kota panosu
-Comment=Ucretsiz API isci havuzunun kalan kullanimi
+GenericName=Model quota dashboard
+Comment=Free API worker pool remaining usage
 Exec=$BIN_DIR/ai-workers open
 Icon=$APP_DIR/icon.svg
 Terminal=false
@@ -61,13 +61,13 @@ Keywords=ai;llm;kota;quota;gemini;groq;openrouter;claude;
 StartupNotify=false
 EOF
 update-desktop-database "$DESK_DIR" >/dev/null 2>&1 || true
-echo "kisayol    : $DESK_DIR/ai-workers.desktop"
+echo "shortcut : $DESK_DIR/ai-workers.desktop"
 
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
-  *) echo "UYARI: $BIN_DIR PATH'te degil. fish icin:"
+  *) echo "WARNING: $BIN_DIR not in PATH. for fish:"
      echo "       fish_add_path $BIN_DIR" ;;
 esac
 
 echo
-echo "kurulum tamam -> ai-workers doctor"
+echo "installation complete -> ai-workers doctor"

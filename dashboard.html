@@ -1,7 +1,7 @@
 <!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ai-workers · kalan kullanım</title>
+<title>ai-workers · remaining usage</title>
 <style>
   :root {
     color-scheme: light;
@@ -76,33 +76,33 @@
 
 <div class="wrap">
   <header>
-    <h1>ai-workers · kalan kullanım</h1>
-    <span class="sub" id="asof">yükleniyor…</span>
+    <h1>ai-workers · remaining usage</h1>
+    <span class="sub" id="asof">loading…</span>
   </header>
 
   <div class="bar">
-    <button id="refresh">Yenile</button>
-    <button id="auto">Oto-yenile: açık</button>
-    <button id="theme">Tema</button>
-    <button id="tbl">Tablo görünümü</button>
+    <button id="refresh">Refresh</button>
+    <button id="auto">Auto-refresh: on</button>
+    <button id="theme">Theme</button>
+    <button id="tbl">Table view</button>
   </div>
 
   <div class="card hero-card">
     <div>
       <div class="hero-num" id="hero">—</div>
-      <div class="hero-lab" id="hero-lab">en sıkı kota</div>
+      <div class="hero-lab" id="hero-lab">tightest quota</div>
     </div>
     <div class="kpis" id="kpis"></div>
   </div>
 
-  <h2>İşçi modeller — kota</h2>
+  <h2>Worker models — quota</h2>
   <div class="card" id="workers"></div>
 
-  <h2>Claude (ana beyin)</h2>
+  <h2>Claude (main brain)</h2>
   <div class="card" id="claude"></div>
 
   <div id="tablewrap" hidden>
-    <h2>Tablo görünümü</h2>
+    <h2>Table view</h2>
     <div class="card scroll"><table id="table"></table></div>
   </div>
 
@@ -111,11 +111,11 @@
 
 <script>
 const $ = s => document.querySelector(s);
-const nf = new Intl.NumberFormat('tr-TR');
+const nf = new Intl.NumberFormat();
 const n = v => (v === null || v === undefined) ? '—' : nf.format(v);
 
-const TR = { 'session':'oturum', 'week':'hafta', 'all models':'tüm modeller',
-             'week (all models)':'hafta (tüm modeller)', 'current':'' };
+const TR = { 'session':'session', 'week':'week', 'all models':'all models',
+             'week (all models)':'week (all models)', 'current':'' };
 function trLabel(x) {
   let t = String(x || '').toLowerCase().trim();
   if (TR[t]) return TR[t];
@@ -126,11 +126,11 @@ function trLabel(x) {
 }
 
 function statusOf(pct) {
-  if (pct === null) return { key:'none', color:'var(--muted)', label:'bilinmiyor', icon:'○' };
-  if (pct > 50)  return { key:'good',     color:'var(--good)',     label:'rahat',    icon:'●' };
-  if (pct > 20)  return { key:'warning',  color:'var(--warning)',  label:'azalıyor', icon:'◆' };
-  if (pct > 5)   return { key:'serious',  color:'var(--serious)',  label:'kritiğe yakın', icon:'▲' };
-  return           { key:'critical', color:'var(--critical)', label:'tükeniyor', icon:'■' };
+  if (pct === null) return { key:'none', color:'var(--muted)', label:'unknown', icon:'○' };
+  if (pct > 50)  return { key:'good',     color:'var(--good)',     label:'comfortable', icon:'●' };
+  if (pct > 20)  return { key:'warning',  color:'var(--warning)',  label:'draining', icon:'◆' };
+  if (pct > 5)   return { key:'serious',  color:'var(--serious)',  label:'near critical', icon:'▲' };
+  return           { key:'critical', color:'var(--critical)', label:'nearly exhausted', icon:'■' };
 }
 
 function meterRow(name, sub, remaining, limit, resetTxt, sourceTxt) {
@@ -144,11 +144,11 @@ function meterRow(name, sub, remaining, limit, resetTxt, sourceTxt) {
     <div class="meter">
       <div class="track"><div class="fill" style="width:${pct === null ? 0 : pct}%;
            background:${st.color}"></div></div>
-      <div class="meter-cap"><span>${sourceTxt || ''}</span><span>${resetTxt ? 'sıfırlanma: ' + resetTxt : ''}</span></div>
+      <div class="meter-cap"><span>${sourceTxt || ''}</span><span>${resetTxt ? 'reset: ' + resetTxt : ''}</span></div>
     </div>
     <div class="status">
       <span class="dot" style="background:${st.color}"></span><b>${n(remaining)}</b> / ${n(limit)}
-      <div style="color:var(--muted);font-size:11.5px">${st.icon} ${st.label}${pct !== null ? ' · %' + pct.toFixed(0) : ''}</div>
+      <div style="color:var(--muted);font-size:11.5px">${st.icon} ${st.label}${pct !== null ? ' · ' + pct.toFixed(0) + '%' : ''}</div>
     </div>`;
   return d;
 }
@@ -162,10 +162,10 @@ function meterPct(name, sub, pct, resetTxt, sourceTxt) {
     <div class="meter">
       <div class="track"><div class="fill" style="width:${pct === null ? 0 : pct}%;
            background:${st.color}"></div></div>
-      <div class="meter-cap"><span>${sourceTxt || ''}</span><span>${resetTxt ? 'sıfırlanma: ' + resetTxt : ''}</span></div>
+      <div class="meter-cap"><span>${sourceTxt || ''}</span><span>${resetTxt ? 'reset: ' + resetTxt : ''}</span></div>
     </div>
     <div class="status">
-      <span class="dot" style="background:${st.color}"></span><b>%${pct === null ? '—' : pct.toFixed(0)}</b> kaldı
+      <span class="dot" style="background:${st.color}"></span><b>${pct === null ? '—' : pct.toFixed(0)}%</b> left
       <div style="color:var(--muted);font-size:11.5px">${st.icon} ${st.label}</div>
     </div>`;
   return d;
@@ -176,9 +176,9 @@ let LAST = null, TIMER = null, AUTO = true;
 function render(d) {
   LAST = d;
   const t = new Date(d.generated_at * 1000);
-  $('#asof').textContent = t.toLocaleTimeString('tr-TR') + ' itibarıyla';
+  $('#asof').textContent = 'as of ' + t.toLocaleTimeString();
 
-  // --- isci modeller
+  // --- worker models
   const host = $('#workers');
   host.textContent = '';
   let tightest = null, notes = [];
@@ -192,20 +192,20 @@ function render(d) {
     if (!w.ready) {
       const r = document.createElement('div');
       r.className = 'row';
-      r.innerHTML = `<div class="row-name">${w.provider}<small>anahtar yok</small></div>
-        <div class="meter"><div class="meter-cap"><span>yapılandırılmadı</span></div></div>
+      r.innerHTML = `<div class="row-name">${w.provider}<small>no key</small></div>
+        <div class="meter"><div class="meter-cap"><span>unconfigured</span></div></div>
         <div class="status" style="color:var(--muted)">—</div>`;
       host.appendChild(r);
       continue;
     }
-    // model bazli limitli saglayici (Gemini)
+    // provider with per-model limits (Gemini)
     if (w.models && w.per_model_limits) {
       const head = document.createElement('div');
       head.className = 'row';
-      head.innerHTML = `<div class="row-name">${w.provider}<small>${w.tier || 'model bazlı limit'}</small></div>
+      head.innerHTML = `<div class="row-name">${w.provider}<small>${w.tier || 'per-model limit'}</small></div>
         <div class="meter"><div class="meter-cap"><span>${w.source}</span>
-          <span>${w.today_requests} istek bugün</span></div></div>
-        <div class="status" style="color:var(--muted);font-size:11.5px">${w.models.length} model</div>`;
+          <span>${w.today_requests} requests today</span></div></div>
+        <div class="status" style="color:var(--muted);font-size:11.5px">${w.models.length} models</div>`;
       host.appendChild(head);
       for (const m of w.models) {
         const dq = (m.quota || {}).day_requests;
@@ -214,16 +214,16 @@ function render(d) {
         if (!dq) continue;
         const ft = m.free_tier;
         const cap = [
-          mq ? `dk istek ${n(mq.used)}/${n(mq.limit)}` : null,
-          tq ? `dk token ${n(tq.used)}/${n(tq.limit)}` : null,
+          mq ? `min req ${n(mq.used)}/${n(mq.limit)}` : null,
+          tq ? `min token ${n(tq.used)}/${n(tq.limit)}` : null,
           ft && ft.day_remaining !== null
-            ? `ücretsizde ${n(ft.day_remaining)}/${n(ft.limits.rpd)} kalırdı` : null,
+            ? `free remaining ${n(ft.day_remaining)}/${n(ft.limits.rpd)}` : null,
         ].filter(Boolean).join(' · ');
         if (ft && ft.exceeded) {
-          notes.push(`${m.model}: ücretsiz katman limitini aşıyor (${ft.exceeded.join(', ')}) — bu kullanım ücretli`);
+          notes.push(`${m.model}: exceeds free tier limit (${ft.exceeded.join(', ')}) — this usage is paid`);
         }
         host.appendChild(meterRow('↳ ' + m.model.replace(/^gemini-/, ''),
-          `${m.requests_today} istek bugün`, dq.remaining, dq.limit, 'günlük', cap));
+          `${m.requests_today} requests today`, dq.remaining, dq.limit, 'daily', cap));
         if (dq.limit > 0) {
           const pct = dq.remaining / dq.limit * 100;
           if (!tightest || pct < tightest.pct) {
@@ -232,7 +232,7 @@ function render(d) {
           }
         }
       }
-      if (w.today_failed) notes.push(`${w.provider}: ${w.today_failed} başarısız istek`);
+      if (w.today_failed) notes.push(`${w.provider}: ${w.today_failed} failed requests`);
       continue;
     }
 
@@ -240,11 +240,11 @@ function render(d) {
     const age = w.as_of_age_sec;
     let src = w.source || '';
     if (age !== undefined && age !== null && age > 120) {
-      src += ` · ${Math.round(age/60)} dk önceki ölçüm`;
+      src += ` · measurement from ${Math.round(age/60)} min ago`;
     }
     if (q && q.requests) {
       const rq = q.requests;
-      host.appendChild(meterRow(w.provider, `${w.today_requests} istek bugün`,
+      host.appendChild(meterRow(w.provider, `${w.today_requests} requests today`,
         rq.remaining, rq.limit, rq.reset, src));
       if (rq.limit > 0 && rq.remaining !== null && rq.remaining !== undefined) {
         const pct = rq.remaining / rq.limit * 100;
@@ -253,25 +253,25 @@ function render(d) {
         }
       }
       if (q.tokens && q.tokens.limit) {
-        host.appendChild(meterRow('', 'token penceresi', q.tokens.remaining, q.tokens.limit,
-          q.tokens.reset, 'dakikalık token bütçesi'));
+        host.appendChild(meterRow('', 'token window', q.tokens.remaining, q.tokens.limit,
+          q.tokens.reset, 'per-minute token budget'));
       }
       if (q.per_minute && q.per_minute.limit) {
-        host.appendChild(meterRow('', 'dakikalık istek', q.per_minute.remaining,
-          q.per_minute.limit, '60 sn', 'yerel sayaç'));
+        host.appendChild(meterRow('', 'requests per minute', q.per_minute.remaining,
+          q.per_minute.limit, '60s', 'local counter'));
       }
     } else {
       const r = document.createElement('div');
       r.className = 'row';
-      r.innerHTML = `<div class="row-name">${w.provider}<small>${w.today_requests} istek bugün</small></div>
+      r.innerHTML = `<div class="row-name">${w.provider}<small>${w.today_requests} requests today</small></div>
         <div class="meter"><div class="meter-cap"><span>${w.source || ''}</span></div></div>
-        <div class="status"><b>${n(w.today_requests)}</b> istek
-          <div style="color:var(--muted);font-size:11.5px">○ limit tanımsız</div></div>`;
+        <div class="status"><b>${n(w.today_requests)}</b> requests
+          <div style="color:var(--muted);font-size:11.5px">○ limit undefined</div></div>`;
       host.appendChild(r);
       if (w.note) notes.push(`${w.provider}: ${w.note}`);
     }
     if (w.credits && w.free_tier === false) {
-      notes.push(`${w.provider}: kredi ${w.credits.remaining}/${w.credits.limit}`);
+      notes.push(`${w.provider}: credit ${w.credits.remaining}/${w.credits.limit}`);
     }
   }
   if (notes.length) {
@@ -281,7 +281,7 @@ function render(d) {
     host.appendChild(b);
   }
 
-  // --- claude canli limitleri de hero yarismasina girer
+  // --- claude live limits also enter the hero competition
   const live = (d.claude && d.claude.live) || {};
   for (const L of (live.limits || [])) {
     if (typeof L.remaining_pct === 'number') {
@@ -292,114 +292,114 @@ function render(d) {
     }
   }
 
-  // --- hero: en sikisan kota
+  // --- hero: tightest quota
   if (tightest) {
-    $('#hero').textContent = '%' + tightest.pct.toFixed(0);
+    $('#hero').textContent = tightest.pct.toFixed(0) + '%';
     $('#hero').style.color = statusOf(tightest.pct).color;
     $('#hero-lab').textContent = tightest.remaining === null
-      ? `en sıkı kota — ${tightest.provider}` +
-        (tightest.resets ? ` · sıfırlanma ${tightest.resets}` : '')
-      : `en sıkı kota — ${tightest.provider}: ${n(tightest.remaining)} / ${n(tightest.limit)} istek kaldı`;
+      ? `tightest quota — ${tightest.provider}` +
+        (tightest.resets ? ` · reset ${tightest.resets}` : '')
+      : `tightest quota — ${tightest.provider}: ${n(tightest.remaining)} / ${n(tightest.limit)} requests left`;
   } else {
     $('#hero').textContent = '—';
-    $('#hero-lab').textContent = 'canlı kota verisi yok';
+    $('#hero-lab').textContent = 'no live quota data';
   }
 
   $('#kpis').innerHTML = `
-    <div><div class="kpi-v">${n(reqToday)}</div><div class="kpi-l">bugün istek</div></div>
-    <div><div class="kpi-v">${n(tokToday)}</div><div class="kpi-l">bugün token</div></div>
-    <div><div class="kpi-v" style="${failToday ? 'color:var(--critical)' : ''}">${n(failToday)}</div><div class="kpi-l">başarısız</div></div>`;
+    <div><div class="kpi-v">${n(reqToday)}</div><div class="kpi-l">requests today</div></div>
+    <div><div class="kpi-v">${n(tokToday)}</div><div class="kpi-l">tokens today</div></div>
+    <div><div class="kpi-v" style="${failToday ? 'color:var(--critical)' : ''}">${n(failToday)}</div><div class="kpi-l">failed</div></div>`;
 
   // --- claude
   const c = d.claude, ch = $('#claude');
   const tt = c.totals || {};
   ch.textContent = '';
 
-  // canli abonelik limitleri (claude -p /usage)
+  // live subscription limits (claude -p /usage)
   if (live.pending) {
     const p = document.createElement('div');
     p.className = 'note';
-    p.textContent = 'Canlı limit ölçümü alınıyor (claude -p /usage)… birkaç saniye sürer, sonraki yenilemede görünür.';
+    p.textContent = 'Fetching live limit measurement (claude -p /usage)… takes a few seconds, will appear on the next refresh.';
     ch.appendChild(p);
   } else if (live.ok && (live.limits || []).length) {
-    const srcTxt = 'canlı · ' + (live.age_sec < 60 ? 'şimdi'
-      : Math.round(live.age_sec / 60) + ' dk önce') + (live.refreshing ? ' · tazeleniyor' : '');
+    const srcTxt = 'live · ' + (live.age_sec < 60 ? 'now'
+      : Math.round(live.age_sec / 60) + ' min ago') + (live.refreshing ? ' · refreshing' : '');
     for (const L of live.limits) {
-      ch.appendChild(meterPct(trLabel(L.label), `%${L.used_pct} kullanıldı`,
+      ch.appendChild(meterPct(trLabel(L.label), `${L.used_pct}% used`,
         L.remaining_pct, L.resets, srcTxt));
     }
   } else if (live.error) {
     const e = document.createElement('div');
     e.className = 'warnbox';
-    e.innerHTML = `⚠ Canlı limit alınamadı: ${live.error}`;
+    e.innerHTML = `⚠ Could not fetch live limits: ${live.error}`;
     ch.appendChild(e);
   }
 
   let html = `<div class="kpis">
-      <div><div class="kpi-v">${n(tt.calls || 0)}</div><div class="kpi-l">bugün istek</div></div>
-      <div><div class="kpi-v">${n(tt.out || 0)}</div><div class="kpi-l">üretilen token</div></div>
-      <div><div class="kpi-v">${n(tt.cache_read || 0)}</div><div class="kpi-l">önbellek okuma</div></div>
-      <div><div class="kpi-v">${n(c.today_sessions || 0)}</div><div class="kpi-l">oturum</div></div>
+      <div><div class="kpi-v">${n(tt.calls || 0)}</div><div class="kpi-l">requests today</div></div>
+      <div><div class="kpi-v">${n(tt.out || 0)}</div><div class="kpi-l">output tokens</div></div>
+      <div><div class="kpi-v">${n(tt.cache_read || 0)}</div><div class="kpi-l">cache read</div></div>
+      <div><div class="kpi-v">${n(c.today_sessions || 0)}</div><div class="kpi-l">sessions</div></div>
     </div>`;
-  // canli veri varsa bayat limit olayini gostermeye gerek yok
+  // no need to show stale limit event if live data exists
   const q = (live.ok && (live.limits || []).length) ? null : c.last_quota_event;
   if (q) {
     const reset = new Date(q.resetsAt * 1000);
     const past = reset < new Date();
-    html += `<div class="warnbox">Son limit olayı: <b>${q.rateLimitType || '?'}</b> · durum
-      <b>${q.status || '?'}</b> · sıfırlanma ${reset.toLocaleString('tr-TR')}
-      ${past ? '<span class="stale">(geçmiş — güncel durumu yansıtmaz)</span>' : ''}</div>`;
+    html += `<div class="warnbox">Last limit event: <b>${q.rateLimitType || '?'}</b> · status
+      <b>${q.status || '?'}</b> · reset ${reset.toLocaleString()}
+      ${past ? '<span class="stale">(past — does not reflect current status)</span>' : ''}</div>`;
   }
   const spans = (live.spans || []).map(s =>
-    `${s.span}: ${n(s.requests)} istek${s.sessions ? ' · ' + s.sessions + ' oturum' : ''}`).join('  ·  ');
-  if (spans) html += `<div class="note">Anthropic sayımı — ${spans}</div>`;
+    `${s.span}: ${n(s.requests)} requests${s.sessions ? ' · ' + s.sessions + ' sessions' : ''}`).join('  ·  ');
+  if (spans) html += `<div class="note">Anthropic count — ${spans}</div>`;
   html += `<div class="note">${c.caveat || ''}</div>`;
   const box = document.createElement('div');
   box.innerHTML = html;
   ch.appendChild(box);
 
-  // --- tablo gorunumu (erisilebilirlik)
+  // --- table view (accessibility)
   const rows = d.workers.map(w => {
     const rq = (w.quota && w.quota.requests) || {};
-    let tr = `<tr><td>${w.provider}</td><td>${w.ready ? 'hazır' : 'anahtar yok'}</td>
+    let tr = `<tr><td>${w.provider}</td><td>${w.ready ? 'ready' : 'no key'}</td>
       <td>${n(w.today_requests)}</td><td>${n(w.today_tokens_in)}</td>
       <td>${n(w.today_tokens_out)}</td><td>${n(rq.remaining)}</td>
       <td>${n(rq.limit)}</td><td>${w.source || ''}</td></tr>`;
     for (const m of (w.models || [])) {
       const dq = (m.quota || {}).day_requests || {};
-      tr += `<tr><td>&nbsp;&nbsp;↳ ${m.model}</td><td>yerel sayaç</td>
+      tr += `<tr><td>&nbsp;&nbsp;↳ ${m.model}</td><td>local counter</td>
         <td>${n(m.requests_today)}</td><td colspan="2">${n(m.tokens_today)} tok</td>
-        <td>${n(dq.remaining)}</td><td>${n(dq.limit)}</td><td>günlük istek</td></tr>`;
+        <td>${n(dq.remaining)}</td><td>${n(dq.limit)}</td><td>daily requests</td></tr>`;
     }
     return tr;
   }).join('');
   const claudeRows = (live.limits || []).map(L =>
-    `<tr><td>Claude · ${trLabel(L.label)}</td><td>canlı</td><td>—</td><td>—</td><td>—</td>
-      <td>%${L.remaining_pct}</td><td>%100</td><td>claude -p /usage</td></tr>`).join('');
+    `<tr><td>Claude · ${trLabel(L.label)}</td><td>live</td><td>—</td><td>—</td><td>—</td>
+      <td>${L.remaining_pct}%</td><td>100%</td><td>claude -p /usage</td></tr>`).join('');
   $('#table').innerHTML =
-    `<thead><tr><th>sağlayıcı</th><th>durum</th><th>istek</th><th>giriş tok.</th>
-      <th>çıkış tok.</th><th>kalan</th><th>limit</th><th>kaynak</th></tr></thead><tbody>${rows}${claudeRows}</tbody>`;
+    `<thead><tr><th>provider</th><th>status</th><th>requests</th><th>input tok.</th>
+      <th>output tok.</th><th>remaining</th><th>limit</th><th>source</th></tr></thead><tbody>${rows}${claudeRows}</tbody>`;
 
   $('#foot').textContent =
-    'Groq ve OpenRouter kotaları sağlayıcıdan canlı gelir. Gemini kota bilgisi sunmadığı için '
-    + 'yerel sayaçla hesaplanır (limit tanımı config.json). Claude yüzdeleri `claude -p /usage` '
-    + 'çıktısından, 2 dakika önbellekle; bu makinedeki oturumlara dayanır, diğer cihazlar dahil değil.';
+    'Groq and OpenRouter quotas are fetched live from the provider. Since Gemini does not provide quota information, '
+    + 'it is calculated with a local counter (limit definitions in config.json). Claude percentages come from `claude -p /usage` '
+    + 'output with a 2-minute cache; based on sessions on this machine, other devices are not included.';
 }
 
 async function load() {
   try {
     const r = await fetch('/api/usage', { cache:'no-store' });
     const d = await r.json();
-    if (d.error) { $('#asof').textContent = 'hata: ' + d.error; return; }
+    if (d.error) { $('#asof').textContent = 'error: ' + d.error; return; }
     render(d);
   } catch (e) {
-    $('#asof').textContent = 'sunucuya ulaşılamadı';
+    $('#asof').textContent = 'could not reach server';
   }
 }
 
 function setAuto(on) {
   AUTO = on;
-  $('#auto').textContent = 'Oto-yenile: ' + (on ? 'açık' : 'kapalı');
+  $('#auto').textContent = 'Auto-refresh: ' + (on ? 'on' : 'off');
   if (TIMER) clearInterval(TIMER);
   if (on) TIMER = setInterval(load, 20000);
 }

@@ -1,8 +1,47 @@
 # ai-workers
 
-A worker pool MCP server for Claude Code. Brain = Claude (orchestrator), workers = free-API models.
+[![CI](https://github.com/msozturktr/ai-workers/actions/workflows/ci.yml/badge.svg)](https://github.com/msozturktr/ai-workers/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)
+![Dependencies: none](https://img.shields.io/badge/dependencies-none-brightgreen.svg)
 
-## Organization diagram
+A worker-pool [MCP](https://modelcontextprotocol.io) server for Claude Code. Claude stays the
+orchestrator (planning, decisions, review); mechanical work such as bulk summaries,
+translation, classification and log scanning goes to cheap or free API models
+(Groq, Gemini, OpenRouter).
+
+The main trick is **file feeding**: Claude passes only paths, the server reads the files and
+returns only the worker's answer, so file contents never enter Claude's context. In a measured
+run this cut Claude-side tokens by **~85%** ([details](#measured-token-savings)).
+
+- Standard library only: no `pip install`, nothing to audit but ~1,700 lines of Python.
+- Automatic fallback across providers, retry with `Retry-After`, per-job failure isolation.
+- Secret files (`.env`, keys, `~/.ssh`, ...) are never sent to a provider.
+- Local dashboard of remaining free-tier quota for every provider (and Claude itself).
+
+## Quick start
+
+Requirements: Python 3.10+ and an API key for at least one provider. `install.sh` (CLI,
+systemd dashboard service, menu shortcut) targets Linux; the MCP server itself runs anywhere
+Python does.
+
+```bash
+git clone https://github.com/msozturktr/ai-workers.git
+cd ai-workers
+
+mkdir -p ~/.config/ai-workers
+printf 'GROQ_API_KEY=...\n' > ~/.config/ai-workers/env    # see "Keys" below
+chmod 600 ~/.config/ai-workers/env
+
+claude mcp add ai-workers --scope user -- python3 "$PWD/server.py"
+bash install.sh       # optional: `ai-workers` CLI + dashboard
+ai-workers doctor     # optional: check the setup
+```
+
+Then just ask Claude Code for the work, e.g. *"summarize every file in src/ in 3 bullets"*;
+the server's instructions tell it to use `fanout` with `files`.
+
+## How it works
 
 ```
 you -> Claude Code (planning, decision, quality control)
@@ -41,8 +80,8 @@ every role, including custom roles from `config.json`.
 The server reads the file itself; the content never enters Claude’s context, only the worker’s output is returned.
 
 ```python
-delegate(role="summarizer", task="...", files=["~/Projeler/gripsim/README.md"])
-fanout(role="classifier", task="...", files=["~/Projeler/gripsim/scripts/**/*.cs"])
+delegate(role="summarizer", task="...", files=["~/code/myapp/README.md"])
+fanout(role="classifier", task="...", files=["~/code/myapp/src/**/*.py"])
 ```
 
 - `delegate`: all files are merged into a single input.  
@@ -60,7 +99,7 @@ fanout(role="classifier", task="...", files=["~/Projeler/gripsim/scripts/**/*.cs
 
 Measured on 2026-10-08 from Claude Code's own transcript (the `usage` of consecutive assistant
 messages, i.e. how much each step grew Claude's context). Task: summarize 4 C# source files
-(gripsim `src/Drivetrain/*.cs`, ~47K characters, ~1,100 lines) in 3-5 bullets each.
+(a game project's drivetrain module, ~47K characters, ~1,100 lines) in 3-5 bullets each.
 
 | Claude-side tokens                           | Claude does it (`Read` x4 + writes summaries) | Delegated (`fanout(files=...)`) | Saving   |
 |----------------------------------------------|----------------------------------------------:|--------------------------------:|---------:|
@@ -120,7 +159,7 @@ At least one key is sufficient; work for a provider without a key automatically 
 ## Installation (as an application)
 
 ```bash
-bash ~/AI/ai-workers/install.sh
+bash install.sh
 ```
 
 Installs three things:
@@ -150,14 +189,14 @@ Examples:
 
 ```bash
 echo "Merhaba dunya" | ai-workers run translator "Translate to English."
-ai-workers fanout summarizer "Summarize the file" -f '~/Projeler/gripsim/*.md' -c 4
+ai-workers fanout summarizer "Summarize the file" -f '~/code/myapp/docs/*.md' -c 4
 ```
 
 ## Remaining-usage dashboard
 
 ```text
-python3 ~/AI/ai-workers/dashboard.py          # http://127.0.0.1:8765
-python3 ~/AI/ai-workers/dashboard.py --once   # JSON to terminal
+python3 dashboard.py          # http://127.0.0.1:8765
+python3 dashboard.py --once   # JSON to terminal
 ```
 
 Binds only to 127.0.0.1 and refreshes every 20 s. The same data appears in the `usage` tool on the MCP side.
@@ -209,7 +248,19 @@ The free tier for Gemini is very tight: Flash models **20 requests/day**, Flash 
 - `fanout` concurrency defaults to 4 (to stay within free-tier rate limits); Groq can safely handle up to 8.  
 - Model names change in free tiers → verify the live list with `models` instead of guessing.
 
-## Manual test
+## Development
+
+```bash
+python3 -m unittest discover -s tests -v                    # offline, no keys needed
+AI_WORKERS_LIVE=1 python3 -m unittest discover -s tests     # also hits real APIs (uses quota)
+```
+
+The offline suite covers file resolution and secret filtering, chunking, provider skip and
+fallback logic, role loading, and the MCP protocol over stdio. Tests run with a temporary
+`HOME` and no API keys, so they never touch your config, ledger or quotas. CI runs them on
+Python 3.10 to 3.13.
+
+Manual smoke test:
 
 ```bash
 printf '%s\n' \
@@ -217,3 +268,10 @@ printf '%s\n' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"org_status","arguments":{}}}' \
   | python3 server.py
 ```
+
+Contributions are welcome. Please keep the project dependency-free and add a test for any
+behavior change.
+
+## License
+
+[MIT](LICENSE)

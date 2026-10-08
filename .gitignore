@@ -1,4 +1,17 @@
 __pycache__/
-*.pyc
+*.py[cod]
+
+# credentials / local config (normally lives in ~/.config/ai-workers, never in the repo)
 .env
+.env.*
 env
+config.json
+ledger.jsonl
+ratelimit.json
+claude_live.json
+
+# editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
