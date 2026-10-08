@@ -1,175 +1,207 @@
 # ai-workers
 
-Claude Code icin isci havuzu MCP server'i. Beyin = Claude (orkestratör), isciler = ucretsiz API modelleri.
+A worker pool MCP server for Claude Code. Brain = Claude (orchestrator), workers = free-API models.
 
-## Organizasyon semasi
+## Organization diagram
 
-    sen -> Claude Code (planlama, karar, kalite kontrolu)
-             |
-         MCP: ai-workers
-           +-- delegate(role, task, files?)   tek is
-           +-- fanout(items[] | files[])      N paralel is (dosya basina bir is)
-           +-- ask(provider, prompt)     dogrudan model cagrisi
-           +-- models(provider)          canli model listesi
-           +-- org_status()              anahtar/rol durumu
+```
+you -> Claude Code (planning, decision, quality control)
+         |
+     MCP: ai-workers
+       +-- delegate(role, task, files?)   single job
+       +-- fanout(items[] | files[])      N parallel jobs (one per file)
+       +-- ask(provider, prompt)          direct model call
+       +-- models(provider)               live model list
+       +-- org_status()                   key/role status
+```
 
-## Roller (varsayilan)
+## Default roles
 
-| rol         | saglayici  | model                    | ise yarar yer                     |
-|-------------|------------|--------------------------|-----------------------------------|
-| researcher  | gemini     | gemini-3.6-flash         | uzun dokuman okuma, arastirma     |
-| summarizer  | groq       | openai/gpt-oss-120b      | toplu ozetleme                    |
-| coder       | groq       | openai/gpt-oss-120b      | kod taslagi, bolerplate           |
-| reviewer    | openrouter | nvidia/nemotron-3-ultra-550b-a55b:free | ikinci goz / elestiri |
-| translator  | groq       | openai/gpt-oss-120b      | ceviri                            |
-| classifier  | groq       | openai/gpt-oss-20b       | etiketleme, triage (en hizli)     |
-| extractor   | groq       | openai/gpt-oss-120b      | metinden yapisal JSON cikarma     |
+| role        | provider   | model                                 | useful for                         |
+|-------------|------------|---------------------------------------|------------------------------------|
+| researcher  | gemini     | gemini-3.6-flash                      | long document reading, research   |
+| summarizer  | groq       | openai/gpt-oss-120b                   | bulk summarization                |
+| coder       | groq       | openai/gpt-oss-120b                   | code scaffolding, boilerplate      |
+| reviewer    | openrouter | nvidia/nemotron-3-ultra-550b-a55b:free| second-eye / critique              |
+| translator  | groq       | openai/gpt-oss-120b                   | translation                        |
+| classifier  | groq       | openai/gpt-oss-20b                    | tagging, triage (fastest)          |
+| extractor   | groq       | openai/gpt-oss-120b                   | structured JSON extraction |
 
-Toplu isler Groq'ta (ucretsiz, gunde 1000 istek); Gemini (Tier 1, ucretli) sadece
-researcher ve Groq'un girdi butcesini asan buyuk-context isler icin.
+Bulk jobs run on Groq (free, 1,000 requests/day); Gemini (Tier 1, paid) is used only for the researcher role and for large-context jobs that exceed Groq’s input budget.
 
-## Dosya besleme (token tasarrufunun asil kaynagi)
+## File feeding (the main source of token savings)
 
-`delegate` ve `fanout` `files` parametresi alir: mutlak yol, dizin veya glob (`~` olur).
-Sunucu dosyayi kendisi okur; icerik Claude'un context'ine hic girmez, sadece isci ciktisi doner.
+`delegate` and `fanout` accept a `files` parameter: absolute path, directory, or glob (`~` works).  
+The server reads the file itself; the content never enters Claude’s context, only the worker’s output is returned.
 
-    delegate(role="summarizer", task="...", files=["~/Projeler/gripsim/README.md"])
-    fanout(role="classifier", task="...", files=["~/Projeler/gripsim/scripts/**/*.cs"])
+```python
+delegate(role="summarizer", task="...", files=["~/Projeler/gripsim/README.md"])
+fanout(role="classifier", task="...", files=["~/Projeler/gripsim/scripts/**/*.cs"])
+```
 
-- `delegate`: tum dosyalar tek girdi olarak birlesir.
-- `fanout`: her dosya ayri is; buyuk dosya satir sinirinda parcalanir (`chunk_chars`,
-  varsayilan rolun saglayici butcesi: Groq ~11K, Gemini 200K karakter). En fazla 200 is.
-- Atlananlar: gizli dosyalar (`.env*`, `*.pem`, `*.key`, `id_rsa*`, `credentials*`, `*secret*`,
-  `~/.ssh`, `~/.config/ai-workers` ...), ikili dosyalar, 8 MB ustu. Dizin/glob taramasinda
-  `.git`, `node_modules`, `__pycache__`, `.godot`, `obj`, `bin`, `.next`, `.venv` atlanir.
-- Saglayici girdi butceleri (`max_input_chars`): groq 12K, openrouter 200K, gemini 1.5M.
-  Asan girdi ag cagrisi yapilmadan sonraki saglayiciya duser.
+- `delegate`: all files are merged into a single input.  
+- `fanout`: each file is a separate job; large files are split on line boundaries (`chunk_chars`, default provider budget: Groq ≈ 11 K, Gemini 200 K characters). Maximum 200 jobs.  
+- Skipped: secret files (`.env*`, `*.pem`, `*.key`, `id_rsa*`, `credentials*`, `*secret*`, `~/.ssh`, `~/.config/ai-workers` …), binary files, > 8 MB. During directory/glob scans, `.git`, `node_modules`, `__pycache__`, `.godot`, `obj`, `bin`, `.next`, `.venv` are ignored.  
+- Provider input budgets (`max_input_chars`): groq 12 K, openrouter 200 K, gemini 1.5 M. Input over a provider's budget falls through to the next provider without a network call.
 
-## Claude Code entegrasyonu
+## Measured token savings
 
-- `initialize` yanitinda `instructions` gonderilir: Claude her oturumda ne zaman isciye
-  vermesi gerektigini ve `files` kullanimini sistem prompt'unda gorur.
-- `delegate` ve `fanout` `_meta["anthropic/alwaysLoad"]=true` ile isaretli: tool search'e
-  ertelenmez, her oturumda tam sema ile yuklu gelir. Diger tool'lar ertelenmis kalir.
-- Tool cagrilari ayri thread'lerde calisir; uzun bir fanout `ping`'i ve diger cagrilari bloklamaz.
+Measured on 2026-10-08 from Claude Code's own transcript (the `usage` of consecutive assistant
+messages, i.e. how much each step grew Claude's context). Task: summarize 4 C# source files
+(gripsim `src/Drivetrain/*.cs`, ~47K characters, ~1,100 lines) in 3-5 bullets each.
 
-Rolleri degistirmek/eklemek: `~/.config/ai-workers/config.json`
+| Claude-side tokens                           | Claude does it (`Read` x4 + writes summaries) | Delegated (`fanout(files=...)`) | Saving   |
+|----------------------------------------------|----------------------------------------------:|--------------------------------:|---------:|
+| Input added to context                       | ~23,900 (file contents)                       | ~4,250 (worker summaries)       |          |
+| Output                                       | ~4,200 (summaries, assumed same length)       | ~70 (the tool call)             |          |
+| **Total tokens**                             | **~28,100**                                   | **~4,320**                      | **~85%** |
+| Cost-weighted (output x5, cache write x1.25) | ~50,900                                       | ~5,700                          | **~89%** |
+| Carried into every later turn (cache read)   | ~28,100                                       | ~4,250                          | ~85%     |
 
-    {
-      "roles": {
-        "coder":  { "provider": "groq", "model": "openai/gpt-oss-120b", "system": "..." },
-        "seo":    { "provider": "gemini", "model": "gemini-3.6-flash", "system": "Sen bir SEO editorusun..." }
-      }
-    }
+Worker side: 6 of 7 jobs (large files are chunked) ran on Groq for free; 1 hit Groq's 8K TPM
+limit and fell back to Gemini (~3.5K input tokens, paid Tier 1).
 
-## Anahtarlar
+What the number depends on:
+
+- **Input/output ratio.** Savings are largest when a lot is read and little comes back
+  (summaries, classification, log scanning). When the output is as long as the input
+  (translation, drafts) it still lands in Claude's context; write it to a file instead
+  (`ai-workers run translator "..." -f doc.md > out.md` from a shell). This README was
+  translated that way.
+- **Verification is not counted.** Worker output is an unreviewed draft; spot-checking it
+  costs Claude tokens.
+- **Chunking hurts quality.** Whole-file summaries were accurate. Chunks of a large file
+  (`Engine.cs` was split in 3) lack context, and the worker guessed API names that do not
+  exist. Check chunked results, raise `chunk_chars`, or use the `researcher` role (Gemini)
+  so the whole file goes to one model.
+- Single measurement (n=1): treat it as an order of magnitude, not a constant.
+
+## Claude Code integration
+
+- The `initialize` response includes `instructions`: Claude sees when to hand off to a worker and how to use `files` in the system prompt of every session.  
+- `delegate` and `fanout` are marked with `_meta["anthropic/alwaysLoad"]=true`: they are not deferred to tool search and are loaded with the full schema each session. Other tools remain deferred.  
+- Tool calls run in separate threads; a long `fanout` does not block the `ping` or other calls.
+
+Changing/adding roles: `~/.config/ai-workers/config.json`
+
+```json
+{
+  "roles": {
+    "coder": { "provider": "groq", "model": "openai/gpt-oss-120b", "system": "..." },
+    "seo":   { "provider": "gemini", "model": "gemini-3.6-flash", "system": "You are an SEO editor..." }
+  }
+}
+```
+
+## Keys
 
 `~/.config/ai-workers/env` (mode 600):
 
-    GEMINI_API_KEY=...        # https://aistudio.google.com/apikey
-    GROQ_API_KEY=...          # https://console.groq.com/keys
-    OPENROUTER_API_KEY=...    # https://openrouter.ai/keys
+```text
+GEMINI_API_KEY=...        # https://aistudio.google.com/apikey
+GROQ_API_KEY=...          # https://console.groq.com/keys
+OPENROUTER_API_KEY=...    # https://openrouter.ai/keys
+```
 
-En az bir anahtar yeterli; eksik saglayicinin isi otomatik olarak digerine duser (fallback sirasi: groq -> gemini -> openrouter).
+At least one key is sufficient; work for a provider without a key automatically falls back to the next one (fallback order: groq → gemini → openrouter).
 
-## Kurulum (uygulama olarak)
+## Installation (as an application)
 
-    bash ~/AI/ai-workers/install.sh
+```bash
+bash ~/AI/ai-workers/install.sh
+```
 
-Uc sey kurar:
+Installs three things:
 
-- `~/.local/bin/ai-workers` - komut
-- `ai-workers.service` (systemd --user) - pano servisi, girislerde otomatik baslar
-- uygulama menusu kisayolu (`ai-workers`, tiklayinca panoyu tarayicida acar)
+- `~/.local/bin/ai-workers` – command  
+- `ai-workers.service` (systemd --user) – dashboard service, starts automatically on login  
+- application-menu shortcut (`ai-workers`, opens the dashboard in a browser when clicked)
 
-Kontrol: `ai-workers doctor`
+Check: `ai-workers doctor`
 
-## Komutlar
+## Commands
 
-    ai-workers                     panoyu ac (servis kapaliysa baslatir)
-    ai-workers usage               kalan kullanim raporu  (--json ham veri)
-    ai-workers status              saglayici + rol durumu
-    ai-workers roles [-v]          tanimli roller
-    ai-workers run <rol> "<is>" [-f yol ...]     tek is; stdin verilirse veri olarak eklenir
-    ai-workers fanout <rol> "<is>" [-f glob ...] stdin'deki her satir / her dosya ayri paralel is
-    ai-workers models <saglayici>  canli model listesi
-    ai-workers serve               panoyu on planda calistir
-    ai-workers start|stop|restart|logs   servis yonetimi
-    ai-workers doctor              kurulum kontrolu
+```text
+ai-workers                     open the dashboard (starts the service if stopped)
+ai-workers usage               remaining-usage report  (--json raw data)
+ai-workers status              provider + role status
+ai-workers roles [-v]          defined roles
+ai-workers run <role> "<task>" [-f path ...]   single job; stdin is added as input if provided
+ai-workers fanout <role> "<task>" [-f glob ...] each line of stdin / each file becomes a separate parallel job
+ai-workers models <provider>   live model list
+ai-workers serve               run the dashboard in the foreground
+ai-workers start|stop|restart|logs   service management
+ai-workers doctor              installation check
+```
 
-Ornekler:
+Examples:
 
-    echo "Merhaba dunya" | ai-workers run translator "Ingilizceye cevir."
-    ai-workers fanout summarizer "Dosyayi ozetle" -f '~/Projeler/gripsim/*.md' -c 4
+```bash
+echo "Merhaba dunya" | ai-workers run translator "Translate to English."
+ai-workers fanout summarizer "Summarize the file" -f '~/Projeler/gripsim/*.md' -c 4
+```
 
-## Kalan kullanim panosu
+## Remaining-usage dashboard
 
-    python3 ~/AI/ai-workers/dashboard.py          # http://127.0.0.1:8765
-    python3 ~/AI/ai-workers/dashboard.py --once   # terminale JSON
+```text
+python3 ~/AI/ai-workers/dashboard.py          # http://127.0.0.1:8765
+python3 ~/AI/ai-workers/dashboard.py --once   # JSON to terminal
+```
 
-Sadece 127.0.0.1'e baglanir, 20 sn'de bir kendini yeniler. MCP tarafinda ayni veri `usage` tool'unda.
+Binds only to 127.0.0.1 and refreshes every 20 s. The same data appears in the `usage` tool on the MCP side.
 
-Kalan kullanim her saglayicida ayni kaynaktan gelmiyor:
+Remaining usage does not come from a single source for each provider:
 
-| saglayici  | kalan kullanim      | kaynak                                      |
-|------------|---------------------|---------------------------------------------|
-| groq       | canli, kesin        | her yanitin `x-ratelimit-*` header'lari     |
-| openrouter | canli, kesin        | `/api/v1/key` -> `free_model_daily_requests`|
-| gemini     | yerel sayac, **model bazli** | kota header'i YOK; limitler config.json'da model model |
-| claude     | **canli, kesin**    | `claude -p /usage` -> oturum ve haftalik kalan % (120 sn onbellek) |
+| provider   | remaining usage | source                                          |
+|------------|-----------------|-------------------------------------------------|
+| groq       | live, exact     | each response’s `x-ratelimit-*` headers        |
+| openrouter | live, exact     | `/api/v1/key` → `free_model_daily_requests`    |
+| gemini     | local counter, **model-specific** | no quota header; limits are in `config.json` per model |
+| claude     | **live, exact** | `claude -p /usage` → session and weekly remaining % (120 s cache) |
 
-Claude'un canli yuzdeleri `claude -p /usage` ciktisindan ayristirilir ve
-`~/.config/ai-workers/claude_live.json`'da 120 sn onbelleklenir; bayatlayinca arka plan
-thread'i tazeler, pano beklemez. Bu sayim bu makinedeki oturumlara dayanir - diger
-cihazlar ve claude.ai dahil degildir.
+Claude’s live percentages are extracted from the `claude -p /usage` output and cached for 120 s in `~/.config/ai-workers/claude_live.json`; a background thread refreshes the cache when stale, so the dashboard does not wait. This count is based on sessions on this machine only – it does **not** include other devices or claude.ai.
 
-Panodaki hero sayisi **tum saglayicilar arasindaki en siki kotadir** (Claude dahil).
+The headline number on the dashboard is **the smallest quota among all providers** (including Claude).
 
-Her istek `~/.config/ai-workers/ledger.jsonl`'e yazilir (ts, saglayici, model, rol, token, hata).
-Groq'un son rate-limit durumu `~/.config/ai-workers/ratelimit.json`'da tutulur.
+Every request is logged to `~/.config/ai-workers/ledger.jsonl` (timestamp, provider, model, role, tokens, error). Groq’s latest rate-limit status is stored in `~/.config/ai-workers/ratelimit.json`.
 
-Gemini limitleri **model bazlidir** (AI Studio > Rate Limits sayfasindan elle girilir):
+Gemini limits are **model-specific** (entered manually from AI Studio → Rate Limits page):
 
-    "limits": { "gemini": { "tier": "Tier 1", "models": {
-      "gemini-3.6-flash":      { "rpm": 1000, "tpm": 2000000, "rpd": 10000 },
-      "gemini-3.5-flash-lite": { "rpm": 4000, "tpm": 4000000, "rpd": 150000 }
-    }}}
+```json
+"limits": { "gemini": { "tier": "Tier 1", "models": {
+  "gemini-3.6-flash":      { "rpm": 1000, "tpm": 2000000, "rpd": 10000 },
+  "gemini-3.5-flash-lite": { "rpm": 4000, "tpm": 4000000, "rpd": 150000 }
+}}}
+```
 
-Pano her model icin ayri metre cizer (gunluk istek) ve altinda dakikalik istek/token
-kullanimini gosterir. Limitler degisirse (tier yukseltme) bu dosyayi guncelle -
-Gemini bunu API'den bildirmiyor.
+The dashboard draws a separate meter for each model (daily requests) and shows minute-level request/token usage underneath. If limits change (tier upgrade), update this file – Gemini does not report changes via the API.
 
-**Dikkat:** Tier 1 ucretsiz katman degildir; faturalandirma bagli bir seviyedir.
-`free_tier_models` altinda ucretsiz katman limitleri de tutulur (AI Studio'daki
-"Compare: Free tier" farklarindan hesaplandi) ve pano her Gemini modeli icin
-"ucretsizde X/Y kalirdi" yazar; asildiginda uyari verir.
+**Note:** Tier 1 is not a free tier; it is a billed level. Free-tier limits are also stored under `free_tier_models` (derived from AI Studio’s “Compare: Free tier” differences) and the dashboard writes “X/Y free remaining” for each Gemini model; it warns when the free quota is exhausted.
 
-Ucretsiz katmanda Gemini cok dar: Flash modelleri **gunde 20 istek**, Flash Lite
-**gunde 500**. Karsilastirma icin Groq gunde 1.000, OpenRouter gunde 50.
-Yani ucretsiz kalmak gerekiyorsa toplu isler Groq'a verilmeli; Gemini sadece
-1M context gereken az sayida ise ayrilmali.
+The free tier for Gemini is very tight: Flash models **20 requests/day**, Flash Lite **500 requests/day**. For comparison, Groq offers 1,000/day, OpenRouter 50/day. To stay free, bulk jobs should go to Groq; Gemini should be reserved for a few jobs that need its 1M-token context.
 
-## Dogrulanmis notlar (2026-10-01 canli test)
+## Verified notes (live test 2026-10-01)
 
-- Groq'a User-Agent basligi sart; yoksa Cloudflare `HTTP 403 error code 1010` dondurur
-- OpenRouter'da `openai/gpt-oss-*:free` kaldirildi; gercek ucretsiz liste icin `models(free_only=true)`
-- `gemini-2.5-flash-lite` yeni hesaplara kapali -> `gemini-3.5-flash-lite`
-- Gemini reasoning modelleri dusunme adiminda token yiyor: `max_tokens` < 512 ise bos yanit gelebilir
-- OpenRouter ucretsiz katman gunluk ~50 istek -> yuksek hacimli `fanout` icin gemini/groq kullan
+- Groq requires a `User-Agent` header; otherwise Cloudflare returns **HTTP 403 error code 1010**.  
+- In OpenRouter, `openai/gpt-oss-*:free` was removed; use `models(free_only=true)` for the actual free list.  
+- `gemini-2.5-flash-lite` is disabled for new accounts → use `gemini-3.5-flash-lite`.  
+- Gemini reasoning models consume tokens during the thinking step: if `max_tokens` < 512 the response may be empty.  
+- OpenRouter’s free tier allows ~50 requests/day → use Gemini/Groq for high-volume `fanout`.
 
-## Dayaniklilik
+## Resilience
 
-- 429/5xx/timeout -> 4 deneme; saglayicinin `Retry-After` degerine uyar, yoksa ustel geri cekilme
-- Rolun saglayicisi tamamen duserse (anahtar yok, girdi cok buyuk, hata) diger saglayicilara fallback;
-  fanout'ta tek isin hatasi digerlerini etkilemez
-- OpenRouter'in HTTP 200 govdesinde dondurdugu hatalar basarisiz sayilir
-- Groq ucretsiz katman model basina 8K token/dk: paralel buyuk isler 429 alir ve Gemini'ye duser
-- `fanout` concurrency varsayilani 4 (ucretsiz katman rate-limitleri icin); Groq'ta 8'e kadar guvenli
-- Model adlari ucretsiz katmanlarda degisiyor -> tahmin etmek yerine `models` ile canli listeyi dogrula
+- 429/5xx/timeout → 4 retries; respects provider’s `Retry-After` header, otherwise exponential backoff.  
+- If a role’s provider completely fails (missing key, input too large, error) it falls back to other providers; a single job failure in a `fanout` does not affect the others.  
+- Errors returned in OpenRouter’s HTTP 200 body are counted as failures.  
+- Groq free tier allows 8 K tokens/min per model: large parallel jobs may hit 429 and fall back to Gemini.  
+- `fanout` concurrency defaults to 4 (to stay within free-tier rate limits); Groq can safely handle up to 8.  
+- Model names change in free tiers → verify the live list with `models` instead of guessing.
 
-## Elle test
+## Manual test
 
-    printf '%s\n' \
-      '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}' \
-      '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"org_status","arguments":{}}}' \
-      | python3 server.py
+```bash
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"org_status","arguments":{}}}' \
+  | python3 server.py
+```
