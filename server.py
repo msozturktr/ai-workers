@@ -7,12 +7,13 @@ import json, os, sys, threading, traceback
 from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import activity as T
 import providers as P
 import usage as U
 import sources as S
 
 PROTOCOL = "2025-06-18"
-SERVER = {"name": "ai-workers", "version": "1.2.0"}
+SERVER = {"name": "ai-workers", "version": "1.3.0"}
 
 INSTRUCTIONS = """ai-workers: worker model pool to save Claude's tokens (Groq/OpenRouter free, Gemini large-context).
 Default: don't do mechanical work yourself, delegate to worker -> bulk summary, translation, classification/labeling, log and output scanning, large file/directory summary, per-file repetitive analysis, draft text, regex/data transformation, boilerplate draft.
@@ -110,7 +111,7 @@ TOOLS = [
 
 
 def _compose(task, data):
-    return f"{task}\n\n--- VERI ---\n{data}" if data else task
+    return f"{task}\n\n--- DATA ---\n{data}" if data else task
 
 
 def _roles():
@@ -152,18 +153,19 @@ def t_delegate(a):
             return "ERROR: no readable files" + S.format_skipped(skipped)
         data = f"{data}\n\n{text}" if data else text
     prompt = _compose(a["task"], data)
-    if a.get("no_fallback"):
+    with T.span("job", label="delegate", role=role, task=T.blob(a["task"]),
+                files=nfiles or None, skipped=len(skipped) or None) as job:
         res = P.chat(spec["provider"], prompt, **kw)
-    else:
-        order = [spec["provider"]] + [p for p in P.FALLBACK_ORDER if p != spec["provider"]]
-        # in fallback, role's model becomes invalid; leave it to provider's default
-        res = P.chat(spec["provider"], prompt, **kw)
-        if not res["ok"]:
+        if not res["ok"] and not a.get("no_fallback"):
+            order = [p for p in P.FALLBACK_ORDER if p != spec["provider"]]
+            job.note("fallback", provider=spec["provider"], error=res.get("error"), next=order)
+            # in fallback, role's model becomes invalid; leave it to provider's default
             kw.pop("model")
-            res2 = P.chat_with_fallback(order[1:], prompt, **kw)
+            res2 = P.chat_with_fallback(order, prompt, **kw)
             if res2.get("ok"):
                 res2["fallback_from"] = [{"provider": spec["provider"], "error": res["error"]}]
                 res = res2
+        _job_result(job, res)
     if not res.get("ok"):
         return ("WORKER FAILED\n" + json.dumps(res, ensure_ascii=False, indent=2)
                 + S.format_skipped(skipped))
@@ -181,6 +183,12 @@ def t_delegate(a):
 
 
 _TRUNC_NOTE = "\n\n[WARNING: response TRUNCATED at max_tokens limit - incomplete; increase max_tokens and try again]"
+
+
+def _job_result(job, res):
+    job.set(status="ok" if res.get("ok") else "error", provider=res.get("provider"),
+            model=res.get("model"), error=None if res.get("ok") else res.get("error"),
+            fallback=bool(res.get("fallback_from")) or None)
 
 
 def _fb_summary(fb):
@@ -244,25 +252,29 @@ def t_fanout(a):
 
     def run_job(j):
         spec = roles[j["role"]]
-        res = P.chat(spec["provider"], _compose(j["task"], j["input"]),
-                     system=spec.get("system"), model=j["model"] or spec.get("model"),
-                     max_tokens=max_tok, role=j["role"])
-        if not res["ok"]:
-            order = [p for p in P.FALLBACK_ORDER if p != spec["provider"]]
-            alt = P.chat_with_fallback(order, _compose(j["task"], j["input"]),
-                                       system=spec.get("system"), max_tokens=max_tok,
-                                       role=j["role"])
-            if alt.get("ok"):
-                alt["fallback_from"] = spec["provider"]
-                res = alt
-            else:
-                res = {"ok": False, "error": _fb_summary(
-                    [{"provider": spec["provider"], "error": res.get("error")}]
-                    + alt.get("tried", []))}
+        with T.span("job", label=j["label"], idx=j["idx"], role=j["role"],
+                    task=T.blob(j["task"])) as job:
+            res = P.chat(spec["provider"], _compose(j["task"], j["input"]),
+                         system=spec.get("system"), model=j["model"] or spec.get("model"),
+                         max_tokens=max_tok, role=j["role"])
+            if not res["ok"]:
+                order = [p for p in P.FALLBACK_ORDER if p != spec["provider"]]
+                job.note("fallback", provider=spec["provider"], error=res.get("error"), next=order)
+                alt = P.chat_with_fallback(order, _compose(j["task"], j["input"]),
+                                           system=spec.get("system"), max_tokens=max_tok,
+                                           role=j["role"])
+                if alt.get("ok"):
+                    alt["fallback_from"] = spec["provider"]
+                    res = alt
+                else:
+                    res = {"ok": False, "error": _fb_summary(
+                        [{"provider": spec["provider"], "error": res.get("error")}]
+                        + alt.get("tried", []))}
+            _job_result(job, res)
         return j, res
 
     with ThreadPoolExecutor(max_workers=conc) as ex:
-        results = list(ex.map(run, jobs))
+        results = [f.result() for f in [ex.submit(T.bound(run), j) for j in jobs]]
 
     ok = sum(1 for _, r in results if r.get("ok"))
     out = [f"# fanout: {ok}/{len(results)} successful (concurrency={conc})"]
@@ -279,8 +291,10 @@ def t_fanout(a):
 
 
 def t_ask(a):
-    res = P.chat(a["provider"], a["prompt"], system=a.get("system"), model=a.get("model"),
-                 max_tokens=a.get("max_tokens", 4096), temperature=a.get("temperature", 0.2))
+    with T.span("job", label="ask") as job:
+        res = P.chat(a["provider"], a["prompt"], system=a.get("system"), model=a.get("model"),
+                     max_tokens=a.get("max_tokens", 4096), temperature=a.get("temperature", 0.2))
+        _job_result(job, res)
     if not res["ok"]:
         return "FAILED\n" + json.dumps(res, ensure_ascii=False, indent=2)
     warn = f"\nWARNING: {res['warning']}" if res.get("warning") else ""
@@ -306,6 +320,53 @@ HANDLERS = {"org_status": t_org_status, "delegate": t_delegate, "fanout": t_fano
 _send_lock = threading.Lock()
 
 
+def _title(name, a):
+    first = lambda s: " ".join(str(s or "").split())[:120]
+    if name in ("delegate", "fanout"):
+        n = len(a.get("items") or [])
+        extra = f" ({n} items)" if name == "fanout" and n else ""
+        return f"{a.get('role') or 'mixed roles'}{extra}: {first(a.get('task'))}"
+    if name == "ask":
+        return f"{a.get('provider')}: {first(a.get('prompt'))}"
+    if name == "models":
+        return f"{a.get('provider')} model list"
+    return name.replace("_", " ")
+
+
+def _args_for_log(a):
+    out = {}
+    for k, v in a.items():
+        if v is None or v == [] or v == "":
+            continue
+        if k in ("input", "prompt", "system", "task"):
+            out[k] = T.blob(v)
+        elif k == "items":
+            out[k] = T.blob(json.dumps(v, ensure_ascii=False, indent=1))
+            out["item_count"] = len(v) if isinstance(v, list) else None
+        else:
+            out[k] = v
+    return out
+
+
+def _status_of(text):
+    if text.startswith(("ERROR", "WORKER FAILED", "FAILED", "SERVER ERROR")):
+        return "error"
+    if text.startswith("WARNING"):
+        return "warning"
+    if text.startswith("# fanout: "):
+        ok, total = text[10:].split(" ", 1)[0].split("/")
+        return "ok" if ok == total else ("error" if ok == "0" else "partial")
+    return "ok"
+
+
+def invoke(name, args):
+    """Run a tool and record it as one activity call (shared by MCP and the CLI)."""
+    with T.span("call", tool=name, title=_title(name, args), args=_args_for_log(args)) as call:
+        text = HANDLERS[name](args)
+        call.set(status=_status_of(text), result=T.blob(text))
+        return text
+
+
 def send(obj):
     line = json.dumps(obj) + "\n"
     with _send_lock:
@@ -313,10 +374,10 @@ def send(obj):
         sys.stdout.flush()
 
 
-def _call_tool(mid, fn, args):
+def _call_tool(mid, name, args):
     """Run tool in a separate thread: long fanout shouldn't block ping and other calls."""
     try:
-        text = fn(args)
+        text = invoke(name, args)
         send({"jsonrpc": "2.0", "id": mid,
               "result": {"content": [{"type": "text", "text": text}]}})
     except Exception:
@@ -327,6 +388,7 @@ def _call_tool(mid, fn, args):
 
 
 def main():
+    T.configure(source="mcp")
     pool = ThreadPoolExecutor(max_workers=6)
     for line in sys.stdin:
         line = line.strip()
@@ -339,6 +401,8 @@ def main():
         mid, method = msg.get("id"), msg.get("method")
         try:
             if method == "initialize":
+                ci = (msg.get("params") or {}).get("clientInfo") or {}
+                T.configure(client=" ".join(str(x) for x in (ci.get("name"), ci.get("version")) if x))
                 send({"jsonrpc": "2.0", "id": mid, "result": {
                     "protocolVersion": PROTOCOL,
                     "capabilities": {"tools": {}},
@@ -360,7 +424,7 @@ def main():
                     send({"jsonrpc": "2.0", "id": mid,
                           "error": {"code": -32602, "message": f"unknown tool: {name}"}})
                     continue
-                pool.submit(_call_tool, mid, fn, args)
+                pool.submit(_call_tool, mid, name, args)
             elif method and method.startswith("notifications/"):
                 continue
             elif mid is not None:

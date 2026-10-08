@@ -14,10 +14,14 @@ The main trick is **file feeding**: Claude passes only paths, the server reads t
 returns only the worker's answer, so file contents never enter Claude's context. In a measured
 run this cut Claude-side tokens by **~85%** ([details](#measured-token-savings)).
 
-- Standard library only: no `pip install`, nothing to audit but ~1,700 lines of Python.
+- Standard library only: no `pip install` for the server, CLI and dashboard.
 - Automatic fallback across providers, retry with `Retry-After`, per-job failure isolation.
 - Secret files (`.env`, keys, `~/.ssh`, ...) are never sent to a provider.
-- Local dashboard of remaining free-tier quota for every provider (and Claude itself).
+- Desktop app with a live **activity log**: who sent what to which model, every retry and
+  fallback, the exact prompts and responses, and what was returned to Claude.
+- Remaining free-tier quota for every provider (and Claude itself).
+
+![Activity log](docs/activity.png)
 
 ## Quick start
 
@@ -162,25 +166,63 @@ At least one key is sufficient; work for a provider without a key automatically 
 bash install.sh
 ```
 
-Installs three things:
+Installs:
 
-- `~/.local/bin/ai-workers` – command  
-- `ai-workers.service` (systemd --user) – dashboard service, starts automatically on login  
-- application-menu shortcut (`ai-workers`, opens the dashboard in a browser when clicked)
+- `~/.local/bin/ai-workers` – command
+- `ai-workers.service` (systemd --user) – dashboard backend, starts automatically on login
+- `io.github.msozturktr.AiWorkers.desktop` + icon – the desktop app in the application menu
 
 Check: `ai-workers doctor`
+
+## Desktop app and activity log
+
+`ai-workers` (or the menu entry) opens a native window (GTK 3 + WebKitGTK) with two tabs:
+
+- **Overview** – remaining quota per provider and model, and Claude's own limits.
+- **Activity** – every tool call, live:
+  - *Now running* strip: calls in flight, the models being waited on, elapsed time.
+  - Call list with search and filters (status, tool, provider); pause to freeze it.
+  - Call detail: a flow diagram (Claude Code → ai-workers → providers → result), the request
+    arguments, a timeline of jobs with one bar segment per provider attempt, and for every
+    attempt the system prompt, the exact input, the response, errors, retries (`HTTP 429 –
+    waited 3.5 s`), fallbacks, token counts, rate-limit headers and the raw event.
+  - Keyboard: `/` search, `j`/`k` or arrows to move, `Ctrl+R` reload, `Ctrl+±` zoom, `F11`.
+
+The window is single-instance and remembers its size. It talks to the dashboard service, or
+serves the UI itself when the service is not running. Needs the system packages
+`python-gobject` and `webkit2gtk-4.1` (Arch) / `python3-gi gir1.2-webkit2-4.1` (Debian/Ubuntu);
+without them `ai-workers app` opens the same UI in the browser (`ai-workers open`).
+
+From a terminal: `ai-workers activity` lists recent calls, `ai-workers activity -f` follows
+them live.
+
+**What is logged and where.** Calls from Claude Code (MCP) and from the CLI are written to
+`~/.config/ai-workers/trace/` (`events-YYYYMMDD.jsonl` plus deduplicated payload files),
+including full prompts, file contents sent to workers and responses. Secret files are filtered
+before anything is sent, so they never reach the log either. Old data is pruned automatically;
+tune or disable it in `config.json`:
+
+```json
+{ "trace": { "enabled": true, "retention_days": 7, "max_mb": 200 } }
+```
+
+The dashboard binds to 127.0.0.1 only, rejects requests whose `Host` header is not a loopback
+name (DNS-rebinding protection) and never sends CORS headers, so other web pages cannot read
+the log.
 
 ## Commands
 
 ```text
-ai-workers                     open the dashboard (starts the service if stopped)
+ai-workers                     open the desktop app (same as `ai-workers app`)
+ai-workers activity [-f] [-n N] recent calls; -f follows live activity (alias: trace)
+ai-workers open                open the dashboard in the browser
 ai-workers usage               remaining-usage report  (--json raw data)
 ai-workers status              provider + role status
 ai-workers roles [-v]          defined roles
-ai-workers run <role> "<task>" [-f path ...]   single job; stdin is added as input if provided
+ai-workers run <role> "<task>" [-f path ...]   single job; piped stdin is the input (ignored with -f)
 ai-workers fanout <role> "<task>" [-f glob ...] each line of stdin / each file becomes a separate parallel job
 ai-workers models <provider>   live model list
-ai-workers serve               run the dashboard in the foreground
+ai-workers serve               run the dashboard backend in the foreground
 ai-workers start|stop|restart|logs   service management
 ai-workers doctor              installation check
 ```
@@ -192,7 +234,7 @@ echo "Merhaba dunya" | ai-workers run translator "Translate to English."
 ai-workers fanout summarizer "Summarize the file" -f '~/code/myapp/docs/*.md' -c 4
 ```
 
-## Remaining-usage dashboard
+## Remaining-usage data
 
 ```text
 python3 dashboard.py          # http://127.0.0.1:8765
@@ -256,7 +298,8 @@ AI_WORKERS_LIVE=1 python3 -m unittest discover -s tests     # also hits real API
 ```
 
 The offline suite covers file resolution and secret filtering, chunking, provider skip and
-fallback logic, role loading, and the MCP protocol over stdio. Tests run with a temporary
+fallback logic, role loading, the MCP protocol over stdio, the activity log (span trees,
+multi-process writes, retention) and the dashboard API. Tests run with a temporary
 `HOME` and no API keys, so they never touch your config, ledger or quotas. CI runs them on
 Python 3.10 to 3.13.
 

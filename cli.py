@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """ai-workers command line application.
 
-  ai-workers                 open dashboard (starts service if needed)
+  ai-workers                 open the desktop app (same as `ai-workers app`)
+  ai-workers activity [-f]   recent calls / follow live activity (alias: trace)
+  ai-workers open            open the dashboard in the browser
   ai-workers usage           remaining usage report
   ai-workers status          organization status (provider + role)
   ai-workers run <role> "<task>" [-f path/glob ...]   single task; piped stdin is the input (ignored with -f)
@@ -17,6 +19,7 @@ import argparse, json, os, shutil, subprocess, sys, urllib.request
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+import activity as T
 import providers as P
 import usage as U
 
@@ -47,7 +50,7 @@ def service_active():
 
 def dashboard_up():
     try:
-        with urllib.request.urlopen(url() + "/api/usage", timeout=3):
+        with urllib.request.urlopen(url() + "/api/health", timeout=3):
             return True
     except Exception:
         return False
@@ -78,6 +81,70 @@ def cmd_open(a):
     if opener and not a.no_browser:
         subprocess.Popen([opener, url()], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return 0
+
+
+def cmd_app(a):
+    """Desktop window (GTK + WebKit); falls back to the browser when they are missing."""
+    import app
+    if not app.available():
+        print(f"desktop app unavailable ({app.why_unavailable()}); opening in the browser",
+              file=sys.stderr)
+        return cmd_open(argparse.Namespace(no_browser=False))
+    cmd = [sys.executable, os.path.join(HERE, "app.py")] + (["--inspect"] if a.inspect else [])
+    if a.foreground:
+        return subprocess.call(cmd)
+    subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+    return 0
+
+
+_MARK = {"ok": "\u2713", "error": "\u2717", "partial": "\u25d0", "warning": "!",
+         "running": "\u25b6", "abandoned": "\u2205"}
+
+
+def _fmt_call(s, color):
+    import time as _t
+    tok = s["tokens"]
+    when = _t.strftime("%H:%M:%S", _t.localtime(s["ts"]))
+    dur = f"{s['dur']:.1f}s" if s.get("dur") is not None else "…"
+    jobs = f"{s['jobs_done']}/{s['jobs']} jobs" if s["jobs"] > 1 else ""
+    who = " · ".join(x for x in (s.get("source"), s.get("project")) if x)
+    code = {"ok": "32", "error": "31", "partial": "33", "warning": "33", "running": "36"}.get(s["status"], "90")
+    mark = _MARK.get(s["status"], "?")
+    if color:
+        mark = f"\033[{code}m{mark}\033[0m"
+    parts = [when, mark, f"{s['tool']:<8}", (s.get("title") or "")[:70], jobs,
+             ", ".join(s["providers"][:2]),
+             f"{tok['in']}\u2192{tok['out']} tok" if tok["in"] or tok["out"] else "", dur,
+             f"[{who}]" if who else ""]
+    return "  ".join(p for p in parts if p)
+
+
+def cmd_activity(a):
+    import time as _t
+    r = T.Reader()
+    r.refresh()
+    color = sys.stdout.isatty()
+    calls = list(reversed(r.list_calls(limit=a.n)))
+    for s in calls:
+        print(_fmt_call(s, color))
+    if not a.follow:
+        if not calls:
+            print(f"no activity yet ({T.TRACE_DIR})")
+        return 0
+    seen = {s["id"]: s["status"] for s in calls}
+    try:
+        while True:
+            _t.sleep(0.5)
+            changed = r.refresh()
+            if not changed:
+                continue
+            for s in reversed(r.list_calls(limit=50)):
+                if s["id"] in changed and seen.get(s["id"]) != s["status"]:
+                    seen[s["id"]] = s["status"]
+                    print(_fmt_call(s, color), flush=True)
+    except KeyboardInterrupt:
+        return 0
 
 
 def cmd_usage(a):
@@ -115,7 +182,7 @@ def cmd_run(a):
         args["model"] = a.model
     if a.files:
         args["files"] = _abs(a.files)
-    print(server.t_delegate(args))
+    print(server.invoke("delegate", args))
     return 0
 
 
@@ -131,7 +198,7 @@ def cmd_fanout(a):
             "concurrency": a.concurrency, "max_tokens": a.max_tokens}
     if a.files:
         args["files"] = _abs(a.files)
-    print(server.t_fanout(args))
+    print(server.invoke("fanout", args))
     return 0
 
 
@@ -185,6 +252,17 @@ def cmd_doctor(a):
 
     print(f"[{'OK     ' if os.path.exists(P.CONFIG_FILE) else 'MISSING'}] config: {P.CONFIG_FILE}")
     print(f"[{'OK     ' if os.path.exists(P.LEDGER) else '-      '}] ledger: {P.LEDGER}")
+    size = files = 0
+    for root, _, names in os.walk(T.TRACE_DIR):
+        for name in names:
+            files += 1
+            size += os.path.getsize(os.path.join(root, name))
+    st = T.SETTINGS
+    print(f"[{'OK     ' if st['enabled'] else '-      '}] activity log: {T.TRACE_DIR} "
+          f"({size / 1e6:.1f} MB, {files} files; keeps {st['retention_days']} d / {st['max_mb']} MB)")
+    import app
+    print(f"[{'OK     ' if app.available() else '-      '}] desktop app (GTK + WebKit)"
+          + ("" if app.available() else f": {app.why_unavailable()} -> browser fallback"))
 
     up = dashboard_up()
     print(f"[{'OK     ' if up else '-      '}] dashboard: {url()}")
@@ -222,7 +300,18 @@ def main():
                                  description="Worker pool consisting of free API models")
     sub = ap.add_subparsers(dest="cmd")
 
-    p = sub.add_parser("open", help="open dashboard in browser (default)")
+    p = sub.add_parser("app", help="open the desktop app (default)")
+    p.add_argument("--foreground", action="store_true", help="do not detach from the terminal")
+    p.add_argument("--inspect", action="store_true", help="enable the web inspector")
+    p.set_defaults(fn=cmd_app)
+
+    p = sub.add_parser("activity", aliases=["trace"],
+                       help="recent tool calls, jobs and provider requests")
+    p.add_argument("-f", "--follow", action="store_true", help="keep printing new activity")
+    p.add_argument("-n", type=int, default=20, help="number of recent calls (default 20)")
+    p.set_defaults(fn=cmd_activity)
+
+    p = sub.add_parser("open", help="open the dashboard in the browser")
     p.add_argument("--no-browser", action="store_true")
     p.set_defaults(fn=cmd_open)
 
@@ -267,9 +356,10 @@ def main():
     p = sub.add_parser("doctor", help="installation check")
     p.set_defaults(fn=cmd_doctor)
 
+    T.configure(source="cli")
     a = ap.parse_args()
     if not a.cmd:
-        a = ap.parse_args(["open"])
+        a = ap.parse_args(["app"])
     sys.exit(a.fn(a))
 
 

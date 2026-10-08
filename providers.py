@@ -1,7 +1,9 @@
 """Single code path for free API providers (all OpenAI-compatible chat endpoints)."""
 import json, os, threading, time, urllib.request, urllib.error
 
-UA = "ai-workers/1.2 (+https://github.com/msozturktr/ai-workers) python-urllib"
+import activity as T
+
+UA = "ai-workers/1.3 (+https://github.com/msozturktr/ai-workers) python-urllib"
 
 CONFIG_DIR = os.path.expanduser("~/.config/ai-workers")
 ENV_FILE = os.path.join(CONFIG_DIR, "env")
@@ -194,8 +196,24 @@ def chat(provider, prompt, system=None, model=None, max_tokens=4096,
 
     Never raises an exception: if no key, unknown provider, or input exceeds provider
     budget, returns {"ok": False, "skipped": True} without making a network call so
-    fallback can move to the next one.
+    fallback can move to the next one. Every call is recorded as a trace "attempt".
     """
+    cfg = PROVIDERS.get(provider) or {}
+    with T.span("attempt", provider=provider, model=model or cfg.get("default_model"),
+                role=role, max_tokens=max_tokens, temperature=temperature,
+                system=T.blob(system), prompt=T.blob(prompt)) as sp:
+        res = _chat(sp, provider, prompt, system, model, max_tokens, temperature,
+                    retries, timeout, role)
+        tok = res.get("tokens")
+        sp.set(status="ok" if res.get("ok") else ("skipped" if res.get("skipped") else "error"),
+               model=res.get("model") or model or cfg.get("default_model"),
+               error=res.get("error"), tokens=tok, finish_reason=res.get("finish_reason"),
+               truncated=res.get("truncated") or None, warning=res.get("warning"),
+               response=T.blob(res.get("text")) if res.get("ok") else None)
+        return res
+
+
+def _chat(sp, provider, prompt, system, model, max_tokens, temperature, retries, timeout, role):
     if provider not in PROVIDERS:
         return {"ok": False, "skipped": True, "provider": provider, "model": model,
                 "error": f"unknown provider: {provider}"}
@@ -227,7 +245,9 @@ def chat(provider, prompt, system=None, model=None, max_tokens=4096,
                 code = err.get("code") if isinstance(err, dict) else None
                 last = f"HTTP 200 body error {code}: {json.dumps(err, ensure_ascii=False)[:600]}"
                 if code in (408, 429, 500, 502, 503, 504) and attempt < retries - 1:
-                    time.sleep(min(2 ** attempt * 2, 20))
+                    delay = min(2 ** attempt * 2, 20)
+                    sp.note("retry", attempt=attempt + 1, error=last, delay=delay)
+                    time.sleep(delay)
                     continue
                 break
             choice = (data.get("choices") or [{}])[0]
@@ -247,22 +267,28 @@ def chat(provider, prompt, system=None, model=None, max_tokens=4096,
                 "truncated": bool(text.strip()) and choice.get("finish_reason") == "length",
             }
             _record(provider, payload["model"], role, res, hdrs)
+            sp.set(ratelimit=_rl_from_headers(hdrs) or None, tries=attempt + 1)
             return res
         except urllib.error.HTTPError as e:
             detail = e.read().decode()[:600]
             last = f"HTTP {e.code}: {detail}"
             if e.code in (408, 409, 425, 429, 500, 502, 503, 504) and attempt < retries - 1:
-                time.sleep(_retry_delay(e.headers, attempt))
+                delay = _retry_delay(e.headers, attempt)
+                sp.note("retry", attempt=attempt + 1, error=last, delay=delay, http=e.code)
+                time.sleep(delay)
                 continue
             break
         except Exception as e:  # network error / timeout
             last = f"{type(e).__name__}: {e}"
             if attempt < retries - 1:
-                time.sleep(min(2 ** attempt * 2, 20))
+                delay = min(2 ** attempt * 2, 20)
+                sp.note("retry", attempt=attempt + 1, error=last, delay=delay)
+                time.sleep(delay)
                 continue
             break
     res = {"ok": False, "provider": provider, "model": payload["model"], "error": last}
     _record(provider, payload["model"], role, res, None)
+    sp.set(tries=attempt + 1)
     return res
 
 
