@@ -55,20 +55,24 @@ PROVIDERS = {
 }
 
 DEFAULT_ROLES = {
-    "researcher":  {"provider": "gemini", "model": "gemini-3.6-flash",
-                    "system": "Sen bir arastirma analistisin. Verilen kaynagi dikkatle oku, sadece metinde gecen olgulara dayanarak yanitla. Emin olmadigin yerde 'belirsiz' yaz. Kisa, maddeli, atif numarali yanit ver."},
-    "summarizer":  {"provider": "groq", "model": "openai/gpt-oss-120b",
-                    "system": "Metni sadiklikla ozetle. Yeni bilgi ekleme, yorum katma. Cikti: en fazla 8 madde."},
+    # Sistem promptlari Ingilizce: Turkce prompt, gorev Ingilizce olsa bile modeli
+    # Turkceye ve promptun formatina cekiyordu (olculdu). Format varsayilandir,
+    # gorev baska bir sey isterse gorev kazanir.
+    "researcher":  {"provider": "gemini", "model": "gemini-3.6-flash", "whole_files": True,
+                    "system": "You are a research analyst. Read the given source carefully and answer only from facts stated in it. Write 'unclear' where you are not sure. Default format: short bullets with numbered citations."},
+    "summarizer":  {"provider": "groq", "model": "openai/gpt-oss-120b", "whole_files": True,
+                    "system": "Summarize the text faithfully. Do not add new information or opinions. Default format: at most 8 bullets."},
     "coder":       {"provider": "groq", "model": "openai/gpt-oss-120b",
-                    "system": "Sen bir yazilim muhendisisin. Sadece calisan kod uret, aciklama istenmedikce yazma. Mevcut dil/stil kurallarina uy."},
+                    "system": "You are a software engineer. Produce only working code; no explanations unless asked. Follow the existing language and style conventions."},
     "reviewer":    {"provider": "openrouter", "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
-                    "system": "Sen bir kod/metin elestirmenisin. Yalnizca somut, dogrulanabilir kusurlari listele. Her bulgu icin: nerede, neden hatali, nasil tetiklenir. Kusur yoksa 'bulgu yok' yaz."},
+                    "whole_files": True,
+                    "system": "You are a code/text reviewer. List only concrete, verifiable defects. For each: where, why it is wrong, how it is triggered. If there are none, say there are no findings."},
     "translator":  {"provider": "groq", "model": "openai/gpt-oss-120b",
-                    "system": "Verilen metni istenen dile cevir. Terimleri koru, aciklama ekleme, sadece cevirisini dondur."},
+                    "system": "Translate the given text into the requested language. Translate every word of natural language; keep code, identifiers, file paths, URLs and formatting unchanged. No explanations; return only the translation."},
     "classifier":  {"provider": "groq", "model": "openai/gpt-oss-20b",
-                    "system": "Sen bir siniflandiricisin. Yalnizca istenen etiketi dondur, baska hicbir sey yazma."},
+                    "system": "You are a classifier. Return only the requested label and nothing else."},
     "extractor":   {"provider": "groq", "model": "openai/gpt-oss-120b",
-                    "system": "Metinden istenen alanlari cikar ve gecerli JSON olarak dondur. Bulunmayan alan icin null kullan. JSON disinda hicbir sey yazma."},
+                    "system": "Extract the requested fields from the text and return them as valid JSON. Use null for missing fields. Output nothing but JSON."},
 }
 
 # Groq ucretsiz ve genis kotali; Gemini (Tier 1, ucretli) buyuk-context isler icin;
@@ -76,8 +80,19 @@ DEFAULT_ROLES = {
 FALLBACK_ORDER = ["groq", "gemini", "openrouter"]
 
 
+# whole_files: fanout'ta dosya parcalanmaz. Parca baglamsiz kalinca ozet/inceleme
+# uyduruyor (olculdu: Engine.cs parcalarinda olmayan metot adlari). Groq'a sigmayan
+# dosya butun olarak buyuk-context saglayiciya duser.
+
+# Bu kural olmadan model girdi verisinin (orn. Turkce kod yorumlari) diline kayiyor.
+LANGUAGE_RULE = ("Unless the task explicitly asks for a different output language, "
+                 "reply in the language the TASK instruction is written in - not the "
+                 "language of the input data or of this system prompt. If the task asks "
+                 "for a specific length or format, it overrides the default format.")
+
+
 def load_roles():
-    roles = dict(DEFAULT_ROLES)
+    roles = {k: dict(v) for k, v in DEFAULT_ROLES.items()}
     try:
         with open(CONFIG_FILE) as f:
             user = json.load(f)
@@ -87,6 +102,8 @@ def load_roles():
             roles[name] = base
     except (FileNotFoundError, json.JSONDecodeError):
         pass
+    for spec in roles.values():
+        spec["system"] = f"{spec.get('system') or ''}\n\n{LANGUAGE_RULE}".strip()
     return roles
 
 

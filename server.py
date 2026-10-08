@@ -65,6 +65,7 @@ TOOLS = [
                 "files": {"type": "array", "items": {"type": "string"},
                           "description": "Mutlak yol/dizin/glob listesi. Her dosya (ya da buyuk dosyanin her parcasi) ortak role+task ile ayri is olur. items ile birlikte kullanilabilir."},
                 "chunk_chars": {"type": "integer", "description": "files icin parca boyu (karakter). Varsayilan: rolun saglayici sinirina gore (Groq ~11K, Gemini 200K)."},
+                "whole_files": {"type": "boolean", "description": "true: dosyalari parcalama, butun gonder (Groq'a sigmayan Gemini'ye duser). summarizer/researcher/reviewer'da varsayilan true; parca baglamsiz kalinca ozet uyduruyor."},
                 "concurrency": {"type": "integer", "description": "Es zamanli istek sayisi. Ucretsiz katman rate-limitleri icin varsayilan 4; Groq'ta 8'e kadar cikilabilir."},
                 "max_tokens": {"type": "integer"},
             },
@@ -204,7 +205,13 @@ def t_fanout(a):
         prov = P.PROVIDERS.get(roles[default_role]["provider"]) or {}
         budget = prov.get("max_input_chars", 200_000) - len(default_task) \
             - len(roles[default_role].get("system") or "") - 500
-        size = int(a.get("chunk_chars") or min(max(budget, 4000), 200_000))
+        whole = a.get("whole_files", roles[default_role].get("whole_files", False))
+        if whole:
+            # parcalama yok: en buyuk butceli saglayiciya sigacak kadar (fallback oraya duser)
+            biggest = max(c["max_input_chars"] for c in P.PROVIDERS.values())
+            size = int(a.get("chunk_chars") or biggest - len(default_task) - 2000)
+        else:
+            size = int(a.get("chunk_chars") or min(max(budget, 4000), 200_000))
         file_items, skipped, err = S.items(a["files"], size)
         if err:
             return f"HATA: {err}"

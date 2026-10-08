@@ -29,6 +29,12 @@ you -> Claude Code (planning, decision, quality control)
 
 Bulk jobs run on Groq (free, 1,000 requests/day); Gemini (Tier 1, paid) is used only for the researcher role and for large-context jobs that exceed Groq’s input budget.
 
+Output language: workers reply in the language of the **task** instruction, not of the input
+data (e.g. an English task over Turkish-commented code gets an English answer), unless the
+task asks for another language. A length/format requested in the task overrides the role's
+default format. Role system prompts are in English; a rule enforcing this is appended to
+every role, including custom roles from `config.json`.
+
 ## File feeding (the main source of token savings)
 
 `delegate` and `fanout` accept a `files` parameter: absolute path, directory, or glob (`~` works).  
@@ -40,7 +46,13 @@ fanout(role="classifier", task="...", files=["~/Projeler/gripsim/scripts/**/*.cs
 ```
 
 - `delegate`: all files are merged into a single input.  
-- `fanout`: each file is a separate job; large files are split on line boundaries (`chunk_chars`, default provider budget: Groq ≈ 11 K, Gemini 200 K characters). Maximum 200 jobs.  
+- `fanout`: each file is a separate job. Maximum 200 jobs.
+  - Roles with `whole_files` (`summarizer`, `researcher`, `reviewer`) never split a file; one
+    that exceeds Groq's budget falls back to Gemini whole. Chunks lose context and made
+    summaries invent things, so understanding-type work gets the full file.
+  - Other roles split large files on line boundaries (`chunk_chars`, default: the role's
+    provider budget, Groq ≈ 11K, Gemini 200K characters). Fine for local work such as
+    extraction or classification. Override per call with `whole_files: true|false`.  
 - Skipped: secret files (`.env*`, `*.pem`, `*.key`, `id_rsa*`, `credentials*`, `*secret*`, `~/.ssh`, `~/.config/ai-workers` …), binary files, > 8 MB. During directory/glob scans, `.git`, `node_modules`, `__pycache__`, `.godot`, `obj`, `bin`, `.next`, `.venv` are ignored.  
 - Provider input budgets (`max_input_chars`): groq 12 K, openrouter 200 K, gemini 1.5 M. Input over a provider's budget falls through to the next provider without a network call.
 
@@ -72,8 +84,8 @@ What the number depends on:
   costs Claude tokens.
 - **Chunking hurts quality.** Whole-file summaries were accurate. Chunks of a large file
   (`Engine.cs` was split in 3) lack context, and the worker guessed API names that do not
-  exist. Check chunked results, raise `chunk_chars`, or use the `researcher` role (Gemini)
-  so the whole file goes to one model.
+  exist. Fixed since: `summarizer`, `researcher` and `reviewer` now send whole files
+  (`whole_files`), so a file too big for Groq goes to Gemini in one piece.
 - Single measurement (n=1): treat it as an order of magnitude, not a constant.
 
 ## Claude Code integration
