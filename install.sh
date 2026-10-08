@@ -33,7 +33,7 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$PY_BIN $APP_DIR/dashboard.py --port 8765
+ExecStart=$PY_BIN $APP_DIR/cli.py serve
 WorkingDirectory=$APP_DIR
 Restart=on-failure
 RestartSec=5
@@ -52,6 +52,10 @@ echo "service  : $(systemctl --user is-active ai-workers.service) / $(systemctl 
 # 3) desktop app: the .desktop file name must equal the app id so Wayland compositors
 #    match the window to its icon and menu entry
 install -m 644 "$APP_DIR/icon.svg" "$ICON_DIR/$APP_ID.svg"
+for png in "$APP_DIR"/icons/*.png; do  # raster sizes for panels that prefer them
+  size="$(basename "$png" .png)"
+  install -D -m 644 "$png" "$HOME/.local/share/icons/hicolor/${size}x${size}/apps/$APP_ID.png"
+done
 rm -f "$DESK_DIR/ai-workers.desktop"  # entry from older versions
 cat > "$DESK_DIR/$APP_ID.desktop" <<EOF
 [Desktop Entry]
@@ -67,8 +71,9 @@ Keywords=ai;llm;mcp;claude;quota;activity;log;gemini;groq;openrouter;
 StartupNotify=true
 StartupWMClass=$APP_ID
 EOF
-gtk-update-icon-cache -q -t "$HOME/.local/share/icons/hicolor" >/dev/null 2>&1 || true
 update-desktop-database "$DESK_DIR" >/dev/null 2>&1 || true
+# KDE Plasma resolves window icons through its own service cache
+command -v kbuildsycoca6 >/dev/null && kbuildsycoca6 >/dev/null 2>&1 || true
 echo "app      : $DESK_DIR/$APP_ID.desktop"
 if ! "$PY_BIN" -c 'import gi; gi.require_version("Gtk","3.0"); gi.require_version("WebKit2","4.1")' 2>/dev/null; then
   echo "NOTE: desktop window needs python-gobject + webkit2gtk-4.1; until then 'ai-workers app' opens the browser"
