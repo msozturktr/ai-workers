@@ -245,7 +245,19 @@ class DashboardApiTest(unittest.TestCase):
     def test_page_served(self):
         status, headers, body = self.get("/")
         self.assertEqual(status, 200)
-        self.assertIn(b'id="tab-activity"', body)
+        self.assertIn(b'src="/ui/core.js"', body)
+
+    def test_ui_assets_served(self):
+        for name, ctype in (("core.js", "text/javascript"), ("apollo.css", "text/css"), ("i18n.js", "text/javascript")):
+            status, headers, body = self.get("/ui/" + name)
+            self.assertEqual(status, 200)
+            self.assertTrue(headers["Content-Type"].startswith(ctype))
+
+    def test_ui_paths_cannot_escape(self):
+        for path in ("/ui/../dashboard.py", "/ui/%2e%2e/dashboard.py", "/ui/.hidden", "/ui/missing.js", "/ui/x.py"):
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                self.get(path)
+            self.assertEqual(cm.exception.code, 404, path)
 
 
 if __name__ == "__main__":

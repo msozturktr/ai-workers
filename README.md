@@ -14,90 +14,118 @@ The main trick is **file feeding**: Claude passes only paths, the server reads t
 returns only the worker's answer, so file contents never enter Claude's context. In a measured
 run this cut Claude-side tokens by **~85%** ([details](#measured-token-savings)).
 
-- Standard library only: no `pip install` for the server, CLI and dashboard.
-- Automatic fallback across providers, retry with `Retry-After`, per-job failure isolation.
-- Secret files (`.env`, keys, `~/.ssh`, ...) are never sent to a provider.
-- Desktop app with a live **activity log**: who sent what to which model, every retry and
-  fallback, the exact prompts and responses, and what was returned to Claude.
-- Remaining free-tier quota for every provider (and Claude itself).
+- **No dependencies.** Server, CLI and dashboard use the Python standard library only.
+- **Resilient.** Automatic fallback across providers, retries that honour `Retry-After`,
+  per-job failure isolation in parallel runs.
+- **Safe by default.** Secret files (`.env`, keys, `~/.ssh`, ...) are never sent to a provider.
+- **Observable.** A desktop app with a live activity log (who sent what to which model, every
+  retry and fallback, the exact prompts and responses) and the remaining quota of every
+  provider, including Claude itself. Three themes, English and Turkish.
 
-![Activity log](docs/activity.png)
+![Activity log, Mission Control theme](docs/mission-control-activity.png)
+
+## Contents
+
+- [Quick start](#quick-start)
+- [How it works](#how-it-works)
+- [File feeding](#file-feeding)
+- [Measured token savings](#measured-token-savings)
+- [Desktop app](#desktop-app)
+- [Command line](#command-line)
+- [Configuration](#configuration)
+- [Quota tracking](#quota-tracking)
+- [Resilience and provider notes](#resilience-and-provider-notes)
+- [Project layout](#project-layout)
+- [Development](#development)
 
 ## Quick start
 
-Requirements: Python 3.10+ and an API key for at least one provider. `install.sh` (CLI,
-systemd dashboard service, menu shortcut) targets Linux; the MCP server itself runs anywhere
-Python does.
+Requirements: Python 3.10+ and an API key for at least one provider. The MCP server runs
+anywhere Python does; `install.sh` (CLI, background service, desktop entry) targets Linux.
 
 ```bash
 git clone https://github.com/msozturktr/ai-workers.git
 cd ai-workers
 
 mkdir -p ~/.config/ai-workers
-printf 'GROQ_API_KEY=...\n' > ~/.config/ai-workers/env    # see "Keys" below
+printf 'GROQ_API_KEY=...\n' > ~/.config/ai-workers/env    # see "Configuration"
 chmod 600 ~/.config/ai-workers/env
 
 claude mcp add ai-workers --scope user -- python3 "$PWD/server.py"
-bash install.sh       # optional: `ai-workers` CLI + dashboard
+bash install.sh       # optional: `ai-workers` CLI, dashboard service, desktop app
 ai-workers doctor     # optional: check the setup
 ```
 
-Then just ask Claude Code for the work, e.g. *"summarize every file in src/ in 3 bullets"*;
-the server's instructions tell it to use `fanout` with `files`.
+Then ask Claude Code for the work, e.g. *"summarize every file in src/ in 3 bullets"*. The
+server's instructions tell Claude to use `fanout` with `files` for that.
 
 ## How it works
 
 ```
-you -> Claude Code (planning, decision, quality control)
-         |
-     MCP: ai-workers
-       +-- delegate(role, task, files?)   single job
-       +-- fanout(items[] | files[])      N parallel jobs (one per file)
-       +-- ask(provider, prompt)          direct model call
-       +-- models(provider)               live model list
-       +-- org_status()                   key/role status
+you ─▶ Claude Code  (planning, decisions, quality control)
+          │
+          ▼  MCP
+      ai-workers
+        ├─ delegate(role, task, files?)    one job
+        ├─ fanout(items[] | files[])       N parallel jobs (one per file or item)
+        ├─ ask(provider, prompt)           direct model call
+        ├─ models(provider)                live model list
+        ├─ usage()                         remaining quota of every provider
+        └─ org_status()                    keys, roles and their models
+          │
+          ▼
+      Groq · Gemini · OpenRouter
 ```
 
-## Default roles
+**Claude Code integration.** The `initialize` response carries `instructions`, so every
+session's system prompt says when to hand work off and how to pass `files`. `delegate` and
+`fanout` are marked `_meta["anthropic/alwaysLoad"]` and are loaded with their full schema
+instead of being deferred to tool search. Tool calls run in threads, so a long `fanout` never
+blocks `ping` or other calls.
 
-| role        | provider   | model                                 | useful for                         |
-|-------------|------------|---------------------------------------|------------------------------------|
-| researcher  | gemini     | gemini-3.6-flash                      | long document reading, research   |
-| summarizer  | groq       | openai/gpt-oss-120b                   | bulk summarization                |
-| coder       | groq       | openai/gpt-oss-120b                   | code scaffolding, boilerplate      |
-| reviewer    | openrouter | nvidia/nemotron-3-ultra-550b-a55b:free| second-eye / critique              |
-| translator  | groq       | openai/gpt-oss-120b                   | translation                        |
-| classifier  | groq       | openai/gpt-oss-20b                    | tagging, triage (fastest)          |
-| extractor   | groq       | openai/gpt-oss-120b                   | structured JSON extraction |
+### Roles
 
-Bulk jobs run on Groq (free, 1,000 requests/day); Gemini (Tier 1, paid) is used only for the researcher role and for large-context jobs that exceed Groq’s input budget.
+| role       | provider   | model                                  | use for                       |
+|------------|------------|----------------------------------------|-------------------------------|
+| researcher | gemini     | gemini-3.6-flash                       | long documents, research      |
+| summarizer | groq       | openai/gpt-oss-120b                    | bulk summarization            |
+| coder      | groq       | openai/gpt-oss-120b                    | scaffolding, boilerplate      |
+| reviewer   | openrouter | nvidia/nemotron-3-ultra-550b-a55b:free | second opinion, critique      |
+| translator | groq       | openai/gpt-oss-120b                    | translation                   |
+| classifier | groq       | openai/gpt-oss-20b                     | tagging, triage (fastest)     |
+| extractor  | groq       | openai/gpt-oss-120b                    | structured JSON extraction    |
 
-Output language: workers reply in the language of the **task** instruction, not of the input
-data (e.g. an English task over Turkish-commented code gets an English answer), unless the
-task asks for another language. A length/format requested in the task overrides the role's
-default format. Role system prompts are in English; a rule enforcing this is appended to
-every role, including custom roles from `config.json`.
+Bulk work runs on Groq (free, 1,000 requests/day). Gemini (Tier 1, paid) serves the researcher
+role and any input too large for Groq. Roles can be changed or added in
+[`config.json`](#configuration).
 
-## File feeding (the main source of token savings)
+**Output language.** Workers answer in the language of the *task* instruction, not of the
+input data (an English task over Turkish-commented code gets an English answer), unless the
+task asks for another language. A length or format requested in the task overrides the role's
+default. This rule is appended to every role, custom ones included.
 
-`delegate` and `fanout` accept a `files` parameter: absolute path, directory, or glob (`~` works).  
-The server reads the file itself; the content never enters Claude’s context, only the worker’s output is returned.
+## File feeding
+
+`delegate` and `fanout` accept `files`: absolute paths, directories or globs (`~` works). The
+server reads them; Claude only sees the worker's output.
 
 ```python
 delegate(role="summarizer", task="...", files=["~/code/myapp/README.md"])
 fanout(role="classifier", task="...", files=["~/code/myapp/src/**/*.py"])
 ```
 
-- `delegate`: all files are merged into a single input.  
-- `fanout`: each file is a separate job. Maximum 200 jobs.
-  - Roles with `whole_files` (`summarizer`, `researcher`, `reviewer`) never split a file; one
-    that exceeds Groq's budget falls back to Gemini whole. Chunks lose context and made
-    summaries invent things, so understanding-type work gets the full file.
-  - Other roles split large files on line boundaries (`chunk_chars`, default: the role's
-    provider budget, Groq ≈ 11K, Gemini 200K characters). Fine for local work such as
-    extraction or classification. Override per call with `whole_files: true|false`.  
-- Skipped: secret files (`.env*`, `*.pem`, `*.key`, `id_rsa*`, `credentials*`, `*secret*`, `~/.ssh`, `~/.config/ai-workers` …), binary files, > 8 MB. During directory/glob scans, `.git`, `node_modules`, `__pycache__`, `.godot`, `obj`, `bin`, `.next`, `.venv` are ignored.  
-- Provider input budgets (`max_input_chars`): groq 12 K, openrouter 200 K, gemini 1.5 M. Input over a provider's budget falls through to the next provider without a network call.
+- `delegate` merges all files into one input. `fanout` makes one job per file (max 200 jobs).
+- **Whole files for understanding.** `summarizer`, `researcher` and `reviewer` never split a
+  file; one that exceeds Groq's budget goes to Gemini in one piece. Chunks lose context and made
+  summaries invent things.
+- **Chunks for local work.** Other roles split large files on line boundaries (`chunk_chars`,
+  default: the provider's budget, Groq ≈ 11K and Gemini 200K characters). Override per call with
+  `whole_files: true|false`.
+- **Never sent:** secret files (`.env*`, `*.pem`, `*.key`, `id_rsa*`, `credentials*`,
+  `*secret*`, `~/.ssh`, `~/.config/ai-workers`, ...), binary files, files over 8 MB. Directory
+  and glob scans skip `.git`, `node_modules`, `__pycache__`, `.venv`, `obj`, `bin`, `.next`, ...
+- **Input budgets** (`max_input_chars`): Groq 12K, OpenRouter 200K, Gemini 1.5M characters.
+  Input over a provider's budget moves to the next provider without a network call.
 
 ## Measured token savings
 
@@ -113,44 +141,111 @@ messages, i.e. how much each step grew Claude's context). Task: summarize 4 C# s
 | Cost-weighted (output x5, cache write x1.25) | ~50,900                                       | ~5,700                          | **~89%** |
 | Carried into every later turn (cache read)   | ~28,100                                       | ~4,250                          | ~85%     |
 
-Worker side: 6 of 7 jobs (large files are chunked) ran on Groq for free; 1 hit Groq's 8K TPM
-limit and fell back to Gemini (~3.5K input tokens, paid Tier 1).
+Worker side: 6 of 7 jobs ran on Groq for free; 1 hit Groq's 8K tokens/minute limit and fell
+back to Gemini (~3.5K input tokens, paid Tier 1).
 
 What the number depends on:
 
 - **Input/output ratio.** Savings are largest when a lot is read and little comes back
   (summaries, classification, log scanning). When the output is as long as the input
-  (translation, drafts) it still lands in Claude's context; write it to a file instead
-  (`ai-workers run translator "..." -f doc.md > out.md` from a shell). This README was
-  translated that way.
-- **Verification is not counted.** Worker output is an unreviewed draft; spot-checking it
-  costs Claude tokens.
-- **Chunking hurts quality.** Whole-file summaries were accurate. Chunks of a large file
-  (`Engine.cs` was split in 3) lack context, and the worker guessed API names that do not
-  exist. Fixed since: `summarizer`, `researcher` and `reviewer` now send whole files
-  (`whole_files`), so a file too big for Groq goes to Gemini in one piece.
+  (translation, drafts) it still lands in Claude's context; write it to a file instead, e.g.
+  `ai-workers run translator "..." -f doc.md > out.md`.
+- **Verification is not counted.** Worker output is an unreviewed draft; spot-checking it costs
+  Claude tokens.
+- **Chunking hurt quality** in this run: chunks of a large file lacked context and the worker
+  guessed API names that do not exist. Understanding-type roles now send whole files.
 - Single measurement (n=1): treat it as an order of magnitude, not a constant.
 
-## Claude Code integration
+## Desktop app
 
-- The `initialize` response includes `instructions`: Claude sees when to hand off to a worker and how to use `files` in the system prompt of every session.  
-- `delegate` and `fanout` are marked with `_meta["anthropic/alwaysLoad"]=true`: they are not deferred to tool search and are loaded with the full schema each session. Other tools remain deferred.  
-- Tool calls run in separate threads; a long `fanout` does not block the `ping` or other calls.
+`ai-workers` (or the menu entry) opens a native window (GTK 3 + WebKitGTK) with two tabs:
 
-Changing/adding roles: `~/.config/ai-workers/config.json`
+- **Overview**: remaining quota per provider and model, plus Claude's own session and weekly
+  limits. The headline number is the tightest quota of all.
+- **Activity**: every tool call from Claude Code and the CLI, live:
+  - calls in flight with the model being waited on and elapsed time;
+  - a searchable, filterable call list that can be paused;
+  - per call: a flow diagram (Claude Code → ai-workers → providers → result), the request
+    arguments, a timeline with one segment per provider attempt, and for every attempt the
+    system prompt, the exact input, the response, errors, retries (`HTTP 429, waited 3.5 s`),
+    fallbacks, token counts, rate-limit headers and the raw event.
 
-```json
-{
-  "roles": {
-    "coder": { "provider": "groq", "model": "openai/gpt-oss-120b", "system": "..." },
-    "seo":   { "provider": "gemini", "model": "gemini-3.6-flash", "system": "You are an SEO editor..." }
-  }
-}
+### Themes and languages
+
+Picked in the top bar and remembered. Each theme keeps the same layout on both tabs.
+
+| Modern | Synthwave | Mission Control |
+|---|---|---|
+| Light or dark, follows the system | Neon outrun HUD, CRT scanlines | 1969 console: amber CRTs, Nixie tubes, analog 0–100% quota gauges, warning lamps |
+| ![Modern](docs/activity.png) | ![Synthwave](docs/synthwave-activity.png) | ![Mission Control overview](docs/mission-control-overview.png) |
+
+<details>
+<summary>More screenshots</summary>
+
+![Synthwave overview](docs/synthwave-overview.png)
+![Mission Control activity](docs/mission-control-activity.png)
+
+</details>
+
+The UI is available in **English** and **Turkish**; the first start follows the system language.
+The retro themes load their fonts from Google Fonts on first use and fall back to system fonts
+offline. The Modern theme makes no external requests.
+
+### Using it
+
+- Keyboard: `/` search, `j`/`k` or arrows to move through calls, `Esc` clears the search.
+  Window: `Ctrl+R` reload, `Ctrl+=`/`Ctrl+-`/`Ctrl+0` zoom, `F11` full screen, `Ctrl+Q` quit.
+- The window is single-instance and remembers its size and zoom. It talks to the dashboard
+  service and serves the UI itself when the service is not running.
+- It needs the system packages `python-gobject` and `webkit2gtk-4.1` (Arch) or
+  `python3-gi gir1.2-webkit2-4.1` (Debian/Ubuntu). Without them `ai-workers app` opens the same
+  UI in the browser.
+- From a terminal: `ai-workers activity` lists recent calls, `ai-workers activity -f` follows
+  them live.
+
+### What is logged
+
+Calls are written to `~/.config/ai-workers/trace/` (`events-YYYYMMDD.jsonl` plus deduplicated
+payload files), **including full prompts, file contents sent to workers and responses**.
+Secret files are filtered before anything is sent, so they never reach the log either. Data
+older than 7 days or beyond 200 MB is pruned automatically; both limits are configurable and
+logging can be turned off (see [Configuration](#configuration)).
+
+The dashboard binds to `127.0.0.1` only, rejects requests whose `Host` header is not a loopback
+name (DNS-rebinding protection) and never sends CORS headers, so other web pages cannot read
+the log.
+
+## Command line
+
+```text
+ai-workers                       open the desktop app (same as `ai-workers app`)
+ai-workers activity [-f] [-n N]  recent calls; -f follows live (alias: trace)
+ai-workers open                  open the dashboard in the browser
+ai-workers usage [--json]        remaining-quota report
+ai-workers status                providers and roles
+ai-workers roles [-v]            defined roles
+ai-workers run <role> "<task>" [-f path ...]     one job; piped stdin is the input (ignored with -f)
+ai-workers fanout <role> "<task>" [-f glob ...]  one job per stdin line or per file
+ai-workers models <provider>     live model list
+ai-workers serve                 run the dashboard backend in the foreground
+ai-workers start|stop|restart|logs   manage the background service
+ai-workers doctor                check the installation
 ```
 
-## Keys
+```bash
+echo "Merhaba dünya" | ai-workers run translator "Translate to English."
+ai-workers fanout summarizer "Summarize the file" -f '~/code/myapp/docs/*.md' -c 4
+```
 
-`~/.config/ai-workers/env` (mode 600):
+`install.sh` installs `~/.local/bin/ai-workers`, a `systemd --user` service for the dashboard
+backend (started on login) and the `io.github.msozturktr.AiWorkers` desktop entry with its icon.
+
+## Configuration
+
+Everything lives in `~/.config/ai-workers/`.
+
+**`env`** (mode 600): API keys. One key is enough; jobs for a provider without a key fall back
+to the next one (order: Groq → Gemini → OpenRouter).
 
 ```text
 GEMINI_API_KEY=...        # https://aistudio.google.com/apikey
@@ -158,152 +253,103 @@ GROQ_API_KEY=...          # https://console.groq.com/keys
 OPENROUTER_API_KEY=...    # https://openrouter.ai/keys
 ```
 
-At least one key is sufficient; work for a provider without a key automatically falls back to the next one (fallback order: groq → gemini → openrouter).
-
-## Installation (as an application)
-
-```bash
-bash install.sh
-```
-
-Installs:
-
-- `~/.local/bin/ai-workers` – command
-- `ai-workers.service` (systemd --user) – dashboard backend, starts automatically on login
-- `io.github.msozturktr.AiWorkers.desktop` + icon – the desktop app in the application menu
-
-Check: `ai-workers doctor`
-
-## Desktop app and activity log
-
-`ai-workers` (or the menu entry) opens a native window (GTK 3 + WebKitGTK) with two tabs:
-
-- **Overview** – remaining quota per provider and model, and Claude's own limits.
-- **Activity** – every tool call, live:
-  - *Now running* strip: calls in flight, the models being waited on, elapsed time.
-  - Call list with search and filters (status, tool, provider); pause to freeze it.
-  - Call detail: a flow diagram (Claude Code → ai-workers → providers → result), the request
-    arguments, a timeline of jobs with one bar segment per provider attempt, and for every
-    attempt the system prompt, the exact input, the response, errors, retries (`HTTP 429 –
-    waited 3.5 s`), fallbacks, token counts, rate-limit headers and the raw event.
-  - Keyboard: `/` search, `j`/`k` or arrows to move, `Ctrl+R` reload, `Ctrl+±` zoom, `F11`.
-
-The window is single-instance and remembers its size. It talks to the dashboard service, or
-serves the UI itself when the service is not running. Needs the system packages
-`python-gobject` and `webkit2gtk-4.1` (Arch) / `python3-gi gir1.2-webkit2-4.1` (Debian/Ubuntu);
-without them `ai-workers app` opens the same UI in the browser (`ai-workers open`).
-
-From a terminal: `ai-workers activity` lists recent calls, `ai-workers activity -f` follows
-them live.
-
-**What is logged and where.** Calls from Claude Code (MCP) and from the CLI are written to
-`~/.config/ai-workers/trace/` (`events-YYYYMMDD.jsonl` plus deduplicated payload files),
-including full prompts, file contents sent to workers and responses. Secret files are filtered
-before anything is sent, so they never reach the log either. Old data is pruned automatically;
-tune or disable it in `config.json`:
+**`config.json`**: every key is optional.
 
 ```json
-{ "trace": { "enabled": true, "retention_days": 7, "max_mb": 200 } }
+{
+  "roles": {
+    "coder": { "model": "openai/gpt-oss-20b" },
+    "seo":   { "provider": "gemini", "model": "gemini-3.6-flash", "system": "You are an SEO editor..." }
+  },
+  "trace": { "enabled": true, "retention_days": 7, "max_mb": 200 },
+  "limits": { "gemini": { "tier": "Tier 1", "models": {
+    "gemini-3.6-flash":      { "rpm": 1000, "tpm": 2000000, "rpd": 10000 },
+    "gemini-3.5-flash-lite": { "rpm": 4000, "tpm": 4000000, "rpd": 150000 }
+  }}},
+  "port": 8765
+}
 ```
 
-The dashboard binds to 127.0.0.1 only, rejects requests whose `Host` header is not a loopback
-name (DNS-rebinding protection) and never sends CORS headers, so other web pages cannot read
-the log.
+| key      | meaning |
+|----------|---------|
+| `roles`  | override fields of a built-in role or add new roles (`provider`, `model`, `system`, `whole_files`) |
+| `trace`  | activity log on/off, retention in days, size cap in MB |
+| `limits` | Gemini quotas per model (Gemini does not report them; copy them from AI Studio → Rate limits). `limits.gemini.free_tier_models` holds the free-tier limits for the "X/Y free remaining" hint |
+| `port`   | dashboard port (default 8765, or `AI_WORKERS_PORT`) |
 
-## Commands
+Other files in the directory are written by ai-workers: `ledger.jsonl` (one line per request:
+time, provider, model, role, tokens, error), `ratelimit.json` (latest Groq rate-limit headers),
+`claude_live.json` (cached Claude limits) and `trace/` (activity log).
 
-```text
-ai-workers                     open the desktop app (same as `ai-workers app`)
-ai-workers activity [-f] [-n N] recent calls; -f follows live activity (alias: trace)
-ai-workers open                open the dashboard in the browser
-ai-workers usage               remaining-usage report  (--json raw data)
-ai-workers status              provider + role status
-ai-workers roles [-v]          defined roles
-ai-workers run <role> "<task>" [-f path ...]   single job; piped stdin is the input (ignored with -f)
-ai-workers fanout <role> "<task>" [-f glob ...] each line of stdin / each file becomes a separate parallel job
-ai-workers models <provider>   live model list
-ai-workers serve               run the dashboard backend in the foreground
-ai-workers start|stop|restart|logs   service management
-ai-workers doctor              installation check
+## Quota tracking
+
+| provider   | remaining quota    | source |
+|------------|--------------------|--------|
+| groq       | live, exact        | `x-ratelimit-*` headers of every response |
+| openrouter | live, exact        | `/api/v1/key` → `free_model_daily_requests` |
+| gemini     | local count, per model | no quota headers; limits from `config.json` |
+| claude     | live, exact        | `claude -p /usage` → session and weekly remaining % |
+
+Claude's percentages are parsed from `claude -p /usage` and cached for 120 s; a background
+thread refreshes the cache so the dashboard never waits. They cover sessions on this machine
+only, not other devices or claude.ai. The same report is available to Claude through the
+`usage` tool and on the terminal through `ai-workers usage`.
+
+Gemini Tier 1 is a billed level. The free tier is tight (Flash 20 requests/day, Flash-Lite
+500/day versus Groq's 1,000 and OpenRouter's 50), so bulk work should go to Groq and Gemini
+should be kept for the few jobs that need its 1M-token context. The dashboard warns when a
+Gemini model goes past its free-tier limits.
+
+## Resilience and provider notes
+
+- 429, 5xx and timeouts are retried up to 4 times, honouring `Retry-After` and otherwise
+  backing off exponentially. Errors that OpenRouter returns inside an HTTP 200 body count as
+  failures.
+- When a role's provider fails (missing key, input too large, error), the job falls back to the
+  other providers. In a `fanout`, one failing job never affects the others.
+- Groq's free tier allows 8K tokens/minute per model, so large parallel runs can hit 429 and
+  move to Gemini. `fanout` runs 4 jobs at a time by default; Groq handles up to 8.
+- Groq requires a `User-Agent` header; without it Cloudflare answers HTTP 403 (error 1010).
+- Reasoning models spend tokens on thinking: with `max_tokens` below ~512 the answer can be
+  empty, and ai-workers reports that as a warning. Truncated answers are flagged as well.
+- Free-tier model names change often (e.g. OpenRouter's `openai/gpt-oss-*:free` disappeared,
+  `gemini-2.5-flash-lite` is closed to new accounts). Check the live list with `models` rather
+  than guessing.
+
+## Project layout
+
 ```
-
-Examples:
-
-```bash
-echo "Merhaba dunya" | ai-workers run translator "Translate to English."
-ai-workers fanout summarizer "Summarize the file" -f '~/code/myapp/docs/*.md' -c 4
+server.py      MCP server (JSON-RPC over stdio): tools, instructions, threading
+providers.py   provider client: retries, fallback, budgets, ledger, role loading
+sources.py     file feeding: path/glob resolution, secret filter, chunking
+activity.py    activity log: span tree writer, retention, incremental reader
+usage.py       remaining-quota snapshot for every provider and Claude
+dashboard.py   local HTTP backend: UI, quota and activity APIs, live event stream
+app.py         desktop window (GTK 3 + WebKitGTK)
+cli.py         `ai-workers` command
+install.sh     CLI, systemd user service, desktop entry and icons
+ui/            the UI: core.js (state, data, actions), i18n.js (EN/TR), one view + stylesheet per theme
+tests/         unit and protocol tests
 ```
-
-## Remaining-usage data
-
-```text
-python3 dashboard.py          # http://127.0.0.1:8765
-python3 dashboard.py --once   # JSON to terminal
-```
-
-Binds only to 127.0.0.1 and refreshes every 20 s. The same data appears in the `usage` tool on the MCP side.
-
-Remaining usage does not come from a single source for each provider:
-
-| provider   | remaining usage | source                                          |
-|------------|-----------------|-------------------------------------------------|
-| groq       | live, exact     | each response’s `x-ratelimit-*` headers        |
-| openrouter | live, exact     | `/api/v1/key` → `free_model_daily_requests`    |
-| gemini     | local counter, **model-specific** | no quota header; limits are in `config.json` per model |
-| claude     | **live, exact** | `claude -p /usage` → session and weekly remaining % (120 s cache) |
-
-Claude’s live percentages are extracted from the `claude -p /usage` output and cached for 120 s in `~/.config/ai-workers/claude_live.json`; a background thread refreshes the cache when stale, so the dashboard does not wait. This count is based on sessions on this machine only – it does **not** include other devices or claude.ai.
-
-The headline number on the dashboard is **the smallest quota among all providers** (including Claude).
-
-Every request is logged to `~/.config/ai-workers/ledger.jsonl` (timestamp, provider, model, role, tokens, error). Groq’s latest rate-limit status is stored in `~/.config/ai-workers/ratelimit.json`.
-
-Gemini limits are **model-specific** (entered manually from AI Studio → Rate Limits page):
-
-```json
-"limits": { "gemini": { "tier": "Tier 1", "models": {
-  "gemini-3.6-flash":      { "rpm": 1000, "tpm": 2000000, "rpd": 10000 },
-  "gemini-3.5-flash-lite": { "rpm": 4000, "tpm": 4000000, "rpd": 150000 }
-}}}
-```
-
-The dashboard draws a separate meter for each model (daily requests) and shows minute-level request/token usage underneath. If limits change (tier upgrade), update this file – Gemini does not report changes via the API.
-
-**Note:** Tier 1 is not a free tier; it is a billed level. Free-tier limits are also stored under `free_tier_models` (derived from AI Studio’s “Compare: Free tier” differences) and the dashboard writes “X/Y free remaining” for each Gemini model; it warns when the free quota is exhausted.
-
-The free tier for Gemini is very tight: Flash models **20 requests/day**, Flash Lite **500 requests/day**. For comparison, Groq offers 1,000/day, OpenRouter 50/day. To stay free, bulk jobs should go to Groq; Gemini should be reserved for a few jobs that need its 1M-token context.
-
-## Verified notes (live test 2026-10-01)
-
-- Groq requires a `User-Agent` header; otherwise Cloudflare returns **HTTP 403 error code 1010**.  
-- In OpenRouter, `openai/gpt-oss-*:free` was removed; use `models(free_only=true)` for the actual free list.  
-- `gemini-2.5-flash-lite` is disabled for new accounts → use `gemini-3.5-flash-lite`.  
-- Gemini reasoning models consume tokens during the thinking step: if `max_tokens` < 512 the response may be empty.  
-- OpenRouter’s free tier allows ~50 requests/day → use Gemini/Groq for high-volume `fanout`.
-
-## Resilience
-
-- 429/5xx/timeout → 4 retries; respects provider’s `Retry-After` header, otherwise exponential backoff.  
-- If a role’s provider completely fails (missing key, input too large, error) it falls back to other providers; a single job failure in a `fanout` does not affect the others.  
-- Errors returned in OpenRouter’s HTTP 200 body are counted as failures.  
-- Groq free tier allows 8 K tokens/min per model: large parallel jobs may hit 429 and fall back to Gemini.  
-- `fanout` concurrency defaults to 4 (to stay within free-tier rate limits); Groq can safely handle up to 8.  
-- Model names change in free tiers → verify the live list with `models` instead of guessing.
 
 ## Development
 
 ```bash
 python3 -m unittest discover -s tests -v                    # offline, no keys needed
-AI_WORKERS_LIVE=1 python3 -m unittest discover -s tests     # also hits real APIs (uses quota)
+AI_WORKERS_LIVE=1 python3 -m unittest discover -s tests     # also calls the real APIs (uses quota)
 ```
 
 The offline suite covers file resolution and secret filtering, chunking, provider skip and
 fallback logic, role loading, the MCP protocol over stdio, the activity log (span trees,
-multi-process writes, retention) and the dashboard API. Tests run with a temporary
-`HOME` and no API keys, so they never touch your config, ledger or quotas. CI runs them on
-Python 3.10 to 3.13.
+multi-process writes, retention) and the dashboard API, including its path and host checks.
+Tests run with a temporary `HOME` and no API keys, so they never touch your config, ledger or
+quotas. CI runs them on Python 3.10 to 3.13.
 
-Manual smoke test:
+The UI is plain JavaScript without a build step. A theme is one view file that registers
+`AW.views[name]` and renders from the shared state in `ui/core.js`, plus its stylesheet; all
+strings go through `AW.t()` and live in `ui/i18n.js`.
+
+Manual smoke test of the MCP server:
 
 ```bash
 printf '%s\n' \

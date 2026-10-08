@@ -4,7 +4,8 @@
   python3 dashboard.py [--port 8765] [--once]
 
 Endpoints
-  GET /                     the UI (dashboard.html)
+  GET /                     the UI (ui/index.html)
+  GET /ui/<file>            UI assets (scripts, stylesheets)
   GET /api/health           liveness probe
   GET /api/usage            remaining-quota snapshot
   GET /api/activity         recent calls (summaries) + currently running count
@@ -15,7 +16,7 @@ Endpoints
 The activity log holds prompts and file contents, so requests must carry a loopback Host
 header (blocks DNS rebinding) and no CORS headers are ever sent (blocks cross-origin reads).
 """
-import argparse, json, os, sys, threading, time
+import argparse, json, os, re, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -23,8 +24,11 @@ import activity
 import usage
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-PAGE = os.path.join(HERE, "dashboard.html")
-VERSION = "1.3.0"
+UI_DIR = os.path.join(HERE, "ui")
+PAGE = os.path.join(UI_DIR, "index.html")
+UI_TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
+            ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml"}
+VERSION = "1.4.0"
 ALLOWED_HOSTS = {"127.0.0.1", "localhost", "[::1]"}
 
 
@@ -50,6 +54,21 @@ class Activity:
 
 
 ACT = None
+_STORAGE = {"ts": 0, "bytes": None}
+
+
+def _storage_bytes():
+    """Disk used by the activity log (cached for 30 s)."""
+    if time.time() - _STORAGE["ts"] > 30:
+        total = 0
+        for base, _, names in os.walk(activity.TRACE_DIR):
+            for name in names:
+                try:
+                    total += os.path.getsize(os.path.join(base, name))
+                except OSError:
+                    pass
+        _STORAGE.update(ts=time.time(), bytes=total)
+    return _STORAGE["bytes"]
 
 
 def _activity():
@@ -102,6 +121,7 @@ class Handler(BaseHTTPRequestHandler):
                 limit = max(1, min(int(query.get("limit", 300)), 2000))
                 calls = act.reader.list_calls(limit=limit)
                 return self._json({"version": act.reader.version, "calls": calls,
+                                   "storage_bytes": _storage_bytes(),
                                    "running": sum(1 for c in calls if c["status"] == "running"),
                                    "settings": activity.SETTINGS, "dir": activity.TRACE_DIR})
             if path.startswith("/api/activity/"):
@@ -116,17 +136,25 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/stream":
                 return self._stream()
             if path in ("/", "/index.html"):
-                try:
-                    with open(PAGE, "rb") as f:
-                        return self._send(200, f.read(), "text/html; charset=utf-8")
-                except FileNotFoundError:
-                    return self._send(500, "dashboard.html not found", "text/plain")
+                return self._asset(PAGE)
+            if path.startswith("/ui/"):
+                name = path[4:]
+                if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", name) or ".." in name:
+                    return self._send(404, "not found", "text/plain; charset=utf-8")
+                return self._asset(os.path.join(UI_DIR, name))
             if path == "/icon.svg":
                 with open(os.path.join(HERE, "icon.svg"), "rb") as f:
                     return self._send(200, f.read(), "image/svg+xml")
             self._send(404, "not found", "text/plain; charset=utf-8")
         except (BrokenPipeError, ConnectionResetError):
             pass
+
+    def _asset(self, path):
+        ctype = UI_TYPES.get(os.path.splitext(path)[1])
+        if not ctype or not os.path.isfile(path):
+            return self._send(404, "not found", "text/plain; charset=utf-8")
+        with open(path, "rb") as f:
+            return self._send(200, f.read(), ctype)
 
     def _stream(self):
         act = _activity()

@@ -3,7 +3,7 @@ import json, os, threading, time, urllib.request, urllib.error
 
 import activity as T
 
-UA = "ai-workers/1.3 (+https://github.com/msozturktr/ai-workers) python-urllib"
+UA = "ai-workers/1.4 (+https://github.com/msozturktr/ai-workers) python-urllib"
 
 CONFIG_DIR = os.path.expanduser("~/.config/ai-workers")
 ENV_FILE = os.path.join(CONFIG_DIR, "env")

@@ -13,7 +13,7 @@ import usage as U
 import sources as S
 
 PROTOCOL = "2025-06-18"
-SERVER = {"name": "ai-workers", "version": "1.3.0"}
+SERVER = {"name": "ai-workers", "version": "1.4.0"}
 
 INSTRUCTIONS = """ai-workers: worker model pool to save Claude's tokens (Groq/OpenRouter free, Gemini large-context).
 Default: don't do mechanical work yourself, delegate to worker -> bulk summary, translation, classification/labeling, log and output scanning, large file/directory summary, per-file repetitive analysis, draft text, regex/data transformation, boilerplate draft.
