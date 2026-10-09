@@ -71,22 +71,28 @@ DEFAULT_ROLES = {
                     "max_tokens": 4096,
                     "system": "You are a research analyst. Read the given source carefully and answer only from facts stated in it. Write 'unclear' where you are not sure. Default format: short bullets with numbered citations."},
     "summarizer":  {"provider": "groq", "model": "openai/gpt-oss-120b", "whole_files": True,
-                    "max_tokens": 2048, "min_tokens": 512, "reasoning_effort": "low",
+                    "max_tokens": 2048, "min_tokens": 512,
+                    "reasoning_effort": {"groq": "low", "gemini": "minimal"},
                     "system": "Summarize the text faithfully. Do not add new information or opinions. Default format: at most 8 bullets."},
     "coder":       {"provider": "groq", "model": "openai/gpt-oss-120b",
-                    "max_tokens": 4096, "min_tokens": 1536,
+                    "max_tokens": 4096, "min_tokens": 1536, "reasoning_effort": {"gemini": "low"},
                     "system": "You are a software engineer. Produce only working code; no explanations unless asked. Follow the existing language and style conventions."},
     "reviewer":    {"provider": "openrouter", "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
                     "whole_files": True, "max_tokens": 4096,
                     "system": "You are a code/text reviewer. List only concrete, verifiable defects. For each: where, why it is wrong, how it is triggered. If there are none, say there are no findings."},
-    "translator":  {"provider": "groq", "model": "openai/gpt-oss-120b", "reasoning_effort": "low",
+    "translator":  {"provider": "groq", "model": "openai/gpt-oss-120b",
+                    "reasoning_effort": {"groq": "low", "gemini": "minimal"},
                     "max_tokens": 4096, "min_tokens": 512, "out_ratio": 1.3,
                     "system": "Translate the given text into the requested language. Translate every word of natural language; keep code, identifiers, file paths, URLs and formatting unchanged. No explanations; return only the translation."},
-    "classifier":  {"provider": "groq", "model": "openai/gpt-oss-20b", "reasoning_effort": "low",
+    "classifier":  {"provider": "groq", "model": "openai/gpt-oss-20b",
+                    "reasoning_effort": {"groq": "low", "gemini": "minimal"},
                     "max_tokens": 512, "min_tokens": 256,
+                    "fallback_models": {"gemini": "gemini-3.5-flash-lite"},
                     "system": "You are a classifier. Return only the requested label and nothing else."},
-    "extractor":   {"provider": "groq", "model": "openai/gpt-oss-120b", "reasoning_effort": "low",
+    "extractor":   {"provider": "groq", "model": "openai/gpt-oss-120b",
+                    "reasoning_effort": {"groq": "low", "gemini": "minimal"},
                     "max_tokens": 2048, "min_tokens": 512,
+                    "fallback_models": {"gemini": "gemini-3.5-flash-lite"}, "validate": "json",
                     "system": "Extract the requested fields from the text and return them as valid JSON. Use null for missing fields. Output nothing but JSON."},
 }
 
@@ -266,9 +272,31 @@ def _cooldown_from_error(provider, model, code, detail, headers):
             _set_cooldown(provider, model, now + ra, f"retry-after {int(ra)}s")
             return True
     elif code == 404 and "model_not_found" in (detail or "").lower():
-        _set_cooldown(provider, model, now + 600, "model not found")
+        _set_cooldown(provider, model, now + 6 * 3600, "model not found")
         return True
     return False
+
+
+_FENCE_RE = re.compile(r"^```[a-zA-Z0-9]*\s*\n(.*?)\n?```\s*$", re.S)
+
+
+def strip_fence(text):
+    """Strip surrounding whitespace and a single surrounding ``` / ```json fence."""
+    t = (text or "").strip()
+    m = _FENCE_RE.match(t)
+    return m.group(1).strip() if m else t
+
+
+def _validate(spec, res):
+    """Role output validation. Returns an error string, or None when ok (res["text"] may be normalised)."""
+    if spec.get("validate") == "json":
+        t = strip_fence(res.get("text"))
+        try:
+            json.loads(t)
+        except ValueError:
+            return "invalid JSON"
+        res["text"] = t
+    return None
 
 
 _THINK_RE = re.compile(r"^\s*<think>.*?</think>\s*", re.S)
@@ -605,6 +633,7 @@ def _record_unlocked(provider, model, role, res, headers):
             "ok": bool(res.get("ok")),
             "in": (res.get("tokens") or {}).get("in") or 0,
             "out": (res.get("tokens") or {}).get("out") or 0,
+            "think": (res.get("tokens") or {}).get("think") or 0,
         }
         if not res.get("ok"):
             row["error"] = str(res.get("error"))[:200]
@@ -685,10 +714,31 @@ def _build_payload(provider, model, msgs, max_tokens, temperature, reasoning_eff
     """Request body; reasoning_effort is sent only to providers/models that accept it."""
     payload = {"model": model, "messages": msgs, "max_tokens": max_tokens,
                "temperature": temperature}
-    if (reasoning_effort and PROVIDERS[provider].get("reasoning")
-            and str(model).startswith("openai/gpt-oss")):
-        payload["reasoning_effort"] = reasoning_effort
+    if isinstance(reasoning_effort, dict):  # per-provider efforts
+        eff = reasoning_effort.get(provider)
+    else:  # plain string keeps the old meaning: Groq only
+        eff = reasoning_effort if provider == "groq" else None
+    if eff:
+        if provider == "gemini":
+            payload["reasoning_effort"] = eff
+        elif PROVIDERS[provider].get("reasoning") and str(model).startswith("openai/gpt-oss"):
+            payload["reasoning_effort"] = eff
     return payload
+
+
+def _think_tokens(usage):
+    """Hidden thinking tokens: reasoning_tokens when reported (already inside
+    completion_tokens), else total - prompt - completion (Gemini bills them separately)."""
+    try:
+        rt = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
+        if rt:
+            return int(rt)
+        p, c, t = (usage.get(k) for k in ("prompt_tokens", "completion_tokens", "total_tokens"))
+        if None in (p, c, t):
+            return 0
+        return max(0, int(t) - int(p) - int(c))
+    except (TypeError, ValueError, AttributeError):
+        return 0
 
 
 def _chat(sp, provider, prompt, system, model, max_tokens, temperature, retries, timeout, role,
@@ -758,7 +808,8 @@ def _chat(sp, provider, prompt, system, model, max_tokens, temperature, retries,
             res = {
                 "ok": True, "provider": provider, "model": payload["model"],
                 "text": text.strip(),
-                "tokens": {"in": usage.get("prompt_tokens"), "out": usage.get("completion_tokens")},
+                "tokens": {"in": usage.get("prompt_tokens"), "out": usage.get("completion_tokens"),
+                           "think": _think_tokens(usage)},
                 "finish_reason": choice.get("finish_reason"),
                 "warning": (
                     "Empty response: model exhausted token budget in thinking step. "
@@ -803,6 +854,11 @@ def _chat(sp, provider, prompt, system, model, max_tokens, temperature, retries,
                 lim = input_limit(provider, payload["model"])
                 if lim and est_in > lim - INPUT_MARGIN_TOKENS:
                     break  # this input can never fit; the router moves on
+            if e.code == 400 and "reasoning_effort" in payload and attempt < retries - 1:
+                # some models reject an effort value (gemini-3.5-flash-lite: "none"); answer without it
+                payload.pop("reasoning_effort")
+                sp.note("retry", attempt=attempt + 1, error=last, delay=0, http=400)
+                continue
             if e.code == 413:
                 _learned_413(provider, payload["model"], size, max_tokens, detail, cls)
                 break
@@ -852,6 +908,7 @@ def run(spec, prompt, max_tokens=None, model=None, no_fallback=False, role=None,
     if not no_cache:
         key = C.make_key(role=role, system=spec.get("system"), provider=spec.get("provider"),
                          model=spec.get("model"), pool=spec.get("pool"),
+                         fallback_models=spec.get("fallback_models"), validate=spec.get("validate"),
                          reasoning_effort=spec.get("reasoning_effort"), override=model,
                          max_tokens=max_tokens, prompt=prompt)
         hit = C.get(key)
@@ -861,7 +918,7 @@ def run(spec, prompt, max_tokens=None, model=None, no_fallback=False, role=None,
             _record_cached(hit, role)
             return hit
     res = _route(spec, prompt, max_tokens, model, no_fallback, role)
-    if key and res.get("ok"):
+    if key and res.get("ok") and not res.get("warning_note"):
         C.put(key, res)
     return res
 
@@ -882,7 +939,8 @@ def _route(spec, prompt, max_tokens=None, model=None, no_fallback=False, role=No
         same += [(prov, m) for m in pool if m != prim]
     groups = [same]
     if not no_fallback:
-        groups += [[(q, PROVIDERS[q]["default_model"])] for q in FALLBACK_ORDER if q != prov]
+        fm = spec.get("fallback_models") or {}
+        groups += [[(q, fm.get(q) or PROVIDERS[q]["default_model"])] for q in FALLBACK_ORDER if q != prov]
 
     size = len(prompt) + len(system or "")
     cls = script_class((system or "") + prompt)
@@ -918,6 +976,12 @@ def _route(spec, prompt, max_tokens=None, model=None, no_fallback=False, role=No
                     route.append({"provider": p, "model": m,
                                   "error": f"truncated at auto max_tokens {mt}"})
                     dead.add(p)  # same-provider siblings share the TPM tier: go to next provider
+                    continue
+                verr = _validate(spec, res)
+                if verr:
+                    res["warning_note"] = "output is not valid JSON"
+                    best = best or res
+                    route.append({"provider": p, "model": m, "error": verr})
                     continue
                 res["route"] = route
                 return res

@@ -92,7 +92,7 @@
   .livestate.on i { background:var(--good); box-shadow:0 0 0 3px color-mix(in srgb, var(--good) 22%, transparent); }
   main { flex:1; min-height:0; }
   .tab { height:100%; }
-  #tab-overview { overflow:auto; padding:22px 20px 56px; }
+  .tab[data-page="overview"] { overflow:auto; padding:22px 20px 56px; }
   #tab-activity { display:flex; flex-direction:column; }
 
   /* now running */

@@ -62,3 +62,68 @@ class OversizedResultTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ThinkingEffortTest(unittest.TestCase):
+    def build(self, provider, model, effort):
+        return P._build_payload(provider, model, [], 100, 0.2, effort)
+
+    def test_role_defaults_per_provider(self):
+        eff = P.DEFAULT_ROLES["summarizer"]["reasoning_effort"]
+        self.assertEqual(self.build("gemini", "gemini-3.6-flash", eff)["reasoning_effort"], "minimal")
+        self.assertEqual(self.build("groq", "openai/gpt-oss-120b", eff)["reasoning_effort"], "low")
+        self.assertNotIn("reasoning_effort", self.build("groq", "qwen/qwen3.8-27b", eff))
+        self.assertNotIn("reasoning_effort", self.build("gemini", "gemini-3.6-flash", "low"))
+        coder = P.DEFAULT_ROLES["coder"]["reasoning_effort"]
+        self.assertNotIn("reasoning_effort", self.build("groq", "openai/gpt-oss-120b", coder))
+        self.assertEqual(self.build("gemini", "gemini-3.6-flash", coder)["reasoning_effort"], "low")
+
+    def test_rejected_effort_retried_without_it(self):
+        import io, urllib.error
+        bodies = []
+
+        def post(url, key, payload, timeout=180):
+            bodies.append(dict(payload))
+            if "reasoning_effort" in payload:
+                raise urllib.error.HTTPError(url, 400, "bad", {}, io.BytesIO(b"invalid argument"))
+            return ({"choices": [{"message": {"content": "positive"}, "finish_reason": "stop"}],
+                     "usage": {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6}}, {})
+        with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "k"}), \
+                mock.patch.object(P, "_post", side_effect=post), mock.patch.object(P, "_record"):
+            res = P.chat("gemini", "x", model="gemini-3.5-flash-lite", max_tokens=50,
+                         reasoning_effort={"gemini": "none"})
+        self.assertTrue(res["ok"])
+        self.assertEqual([("reasoning_effort" in b) for b in bodies], [True, False])
+
+    def test_think_tokens(self):
+        self.assertEqual(P._think_tokens({"prompt_tokens": 10000, "completion_tokens": 164,
+                                          "total_tokens": 14219}), 4055)
+        self.assertEqual(P._think_tokens({"prompt_tokens": 10, "completion_tokens": 20,
+                                          "total_tokens": 30}), 0)
+        self.assertEqual(P._think_tokens({"prompt_tokens": 10, "completion_tokens": 200,
+                                          "total_tokens": 210,
+                                          "completion_tokens_details": {"reasoning_tokens": 150}}), 150)
+        self.assertEqual(P._think_tokens({}), 0)
+
+    def test_ledger_row_and_report(self):
+        import json, usage as U
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.object(P, "LEDGER", os.path.join(d, "l.jsonl")), \
+                mock.patch.object(P, "RATELIMIT_SNAPSHOT", os.path.join(d, "rl.json")), \
+                mock.patch.object(P, "CONFIG_DIR", d):
+            P._record("gemini", "g", "r", {"ok": True, "tokens": {"in": 5, "out": 2, "think": 3900}}, {})
+            row = json.loads(open(P.LEDGER).readline())
+            self.assertEqual(row["think"], 3900)
+            e = U.efficiency([row])
+            self.assertEqual(e["think_tokens"], 3900)
+            txt = U.format_report({"workers": [], "claude": {}, "efficiency": e})
+            self.assertIn("3.9K thinking", txt)
+            e0 = U.efficiency([dict(row, think=0)])
+            self.assertNotIn("thinking", U.format_report({"workers": [], "claude": {}, "efficiency": e0}))
+            w = {"provider": "gemini", "ready": True, "today_requests": 1, "today_failed": 0,
+                 "today_tokens_in": 5250, "today_tokens_out": 281, "today_tokens_think": 3900,
+                 "source": "local counter", "quota": None}
+            self.assertIn("5250+281 tokens (+3.9K thinking)",
+                          U.format_report({"workers": [w], "claude": {}}))
+            w["today_tokens_think"] = 0
+            self.assertNotIn("thinking", U.format_report({"workers": [w], "claude": {}}))

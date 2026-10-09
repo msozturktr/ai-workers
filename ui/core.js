@@ -43,6 +43,9 @@ AW.upper = s => String(s ?? '').toLocaleUpperCase(AW.locale());
 const n = AW.n = v => (v === null || v === undefined) ? '—' : nf.format(v);
 const esc = AW.esc = s => String(s ?? '').replace(/[&<>"']/g, c =>
   ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+AW.effText = e => e ? {
+  share: t('eff_free_share', { pct: e.free_pct, free: e.free, jobs: e.jobs }),
+  cache: t('eff_cache', { n: e.cache_hits || 0, tok: AW.kfmt(e.tokens_saved || 0) }) } : null;
 AW.kfmt = v => v == null ? '—' : v >= 1e6 ? (v / 1e6).toFixed(1) + 'M' : v >= 1e3 ? (v / 1e3).toFixed(1) + 'K' : String(v);
 const dfmt = AW.dfmt = s => s == null ? '—' : s < 1 ? Math.round(s * 1000) + ' ms'
   : s < 60 ? s.toFixed(1) + ' s' : Math.floor(s / 60) + 'm ' + String(Math.round(s % 60)).padStart(2, '0') + 's';
@@ -120,7 +123,12 @@ function buildModel(d) {
       meters.push({ kind: 'provider', provider: w.provider, name: w.provider, remaining: rq.remaining, limit: rq.limit, pct,
                     unit: 'req_day', reset: AW.bx(rq.reset), source: src, requests: w.today_requests });
       consider(pct, w.provider, { remaining: rq.remaining, limit: rq.limit });
-      if (q.tokens && q.tokens.limit) meters.push({ kind: 'window', provider: w.provider, name: `${w.provider} ${t('token_window')}`,
+      if (q.tokens && Array.isArray(q.tokens.models) && q.tokens.models.length) {
+        for (const tm of q.tokens.models) meters.push({ kind: 'window', provider: w.provider,
+          name: `${w.provider} · ${String(tm.model || '').replace(/^(openai|qwen)\//, '')}`,
+          remaining: tm.remaining, limit: tm.limit, pct: pctOf(tm.remaining, tm.limit),
+          unit: 'tok_min', reset: tm.age_sec != null ? t('measured_ago', { n: Math.max(1, Math.round(tm.age_sec / 60)) }) : '', source: t('per_min_tokens') });
+      } else if (q.tokens && q.tokens.limit) meters.push({ kind: 'window', provider: w.provider, name: `${w.provider} ${t('token_window')}`,
         remaining: q.tokens.remaining, limit: q.tokens.limit, pct: pctOf(q.tokens.remaining, q.tokens.limit),
         unit: 'tok_min', reset: AW.bx(q.tokens.reset), source: t('per_min_tokens') });
       if (q.per_minute && q.per_minute.limit) meters.push({ kind: 'window', provider: w.provider, name: `${w.provider} ${t('per_min_requests')}`,
@@ -138,7 +146,7 @@ function buildModel(d) {
   for (const L of limits) consider(L.pct, 'Claude · ' + L.label, { resets: L.resets, claude: true });
   const tt = c.totals || {};
   return {
-    generated: d.generated_at, meters, notes, tightest, kpis: { req, tok, fail },
+    generated: d.generated_at, meters, notes, tightest, kpis: { req, tok, fail }, efficiency: d.efficiency || null,
     claude: { limits, pending: !!live.pending, ok: !!live.ok, error: live.error ? AW.bx(live.error) : null,
               age: live.age_sec, refreshing: !!live.refreshing,
               calls: tt.calls || 0, out: tt.out || 0, cacheRead: tt.cache_read || 0, sessions: c.today_sessions || 0,

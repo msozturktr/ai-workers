@@ -465,3 +465,66 @@ class PerModelSnapshotTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ResilienceTest(RouterTest):
+    def ext(self):
+        return dict(P.DEFAULT_ROLES["extractor"])
+
+    def test_classifier_fallback_uses_flash_lite(self):
+        spec = dict(P.DEFAULT_ROLES["classifier"])
+        os.environ.pop("GROQ_API_KEY")
+        with self.post([_ok("L")]):
+            r = P.run(spec, "hi", role="classifier")
+        self.assertEqual(r["provider"], "gemini")
+        self.assertEqual(r["model"], "gemini-3.5-flash-lite")
+
+    def test_summarizer_fallback_keeps_gemini_default(self):
+        spec = dict(P.DEFAULT_ROLES["summarizer"])
+        with self.post([_ok("g")]):
+            r = P.run(spec, "x" * 40_000, role="summarizer")
+        self.assertEqual(r["model"], P.PROVIDERS["gemini"]["default_model"])
+
+    def test_extractor_fence_stripped(self):
+        with self.post([_ok('```json\n{"a": 1}\n```')]):
+            r = P.run(self.ext(), "hi", role="extractor")
+        self.assertEqual(r["text"], '{"a": 1}')
+        self.assertNotIn("warning_note", r)
+
+    def test_extractor_invalid_json_tries_next_sibling(self):
+        with self.post([_ok("not json"), _ok('{"a": 1}')]):
+            r = P.run(self.ext(), "hi", role="extractor")
+        self.assertEqual(r["model"], "qwen/qwen3.8-27b")
+        self.assertEqual(r["text"], '{"a": 1}')
+        self.assertEqual(r["route"][0]["error"], "invalid JSON")
+
+    def test_extractor_all_invalid_returns_best_with_note_uncached(self):
+        with self.post([_ok("bad")] * 10):
+            r = P.run(self.ext(), "hi", role="extractor")
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["text"], "bad")
+        self.assertEqual(r["warning_note"], "output is not valid JSON")
+        self.assertFalse(r.get("warning"))
+        n = len(self.calls)
+        with self.post([_ok("bad")] * 10):
+            r2 = P.run(self.ext(), "hi", role="extractor")
+        self.assertFalse(r2.get("cached"))
+        self.assertGreater(len(self.calls), n)
+
+    def test_model_not_found_cooldown_6h(self):
+        t0 = time.time()
+        P._cooldown_from_error("groq", "m", 404, '{"code":"model_not_found"}', {})
+        until = P._cooldown[("groq", "m")][0]
+        self.assertAlmostEqual(until - t0, 6 * 3600, delta=5)
+
+    def test_server_warning_note_and_org_status_cooling(self):
+        import server
+        res = {"ok": True, "provider": "groq", "model": "m", "text": "bad", "tokens": {},
+               "warning_note": "output is not valid JSON", "route": []}
+        with mock.patch.object(server.P, "run", return_value=res):
+            out = server.t_delegate({"role": "extractor", "task": "t", "input": "x"})
+        self.assertIn("[WARNING: output is not valid JSON]", out)
+        P._set_cooldown("groq", "openai/gpt-oss-120b", time.time() + 3600, "model not found")
+        st = server.t_org_status({})
+        self.assertIn("cooling down until", st)
+        self.assertIn("pool openai/gpt-oss-120b", st)

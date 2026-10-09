@@ -97,7 +97,7 @@ function renderUsage() {
                    x.free ? t('free_left', { r: n(x.free.remaining), l: n(x.free.limit) }) : null].filter(Boolean).join(' · ');
       rows += meterRow('↳ ' + x.short, t('req_today', { n: x.requests }), x.remaining, x.limit, x.pct, x.reset, cap);
     } else if (x.kind === 'provider') rows += meterRow(x.name, t('req_today', { n: x.requests }), x.remaining, x.limit, x.pct, x.reset, x.source);
-    else if (x.kind === 'window') rows += meterRow('', x.unit === 'tok_min' ? t('token_window') : t('per_min_requests'), x.remaining, x.limit, x.pct, x.reset, x.source);
+    else if (x.kind === 'window') rows += meterRow('', x.unit === 'tok_min' ? (x.name.includes('·') ? `${x.name.split('·').pop().trim()} · ${t('token_window')}` : t('token_window')) : t('per_min_requests'), x.remaining, x.limit, x.pct, x.reset, x.source);
     else if (x.kind === 'unlimited') rows += `<div class="row"><div class="row-name">${esc(x.provider)}<small>${t('req_today', { n: x.requests })}</small></div>
       <div class="meter"><div class="meter-cap"><span>${esc(x.source)}</span></div></div>
       <div class="status"><b>${t('requests_n', { n: n(x.requests) })}</b><div style="color:var(--muted);font-size:11.5px">○ ${t('limit_undefined')}</div></div></div>`;
@@ -114,7 +114,8 @@ function renderUsage() {
   $('[data-role="kpis"]').innerHTML = `
     <div><div class="kpi-v">${n(m.kpis.req)}</div><div class="kpi-l">${t('kpi_req_today')}</div></div>
     <div><div class="kpi-v">${n(m.kpis.tok)}</div><div class="kpi-l">${t('kpi_tok_today')}</div></div>
-    <div><div class="kpi-v" style="${m.kpis.fail ? 'color:var(--critical)' : ''}">${n(m.kpis.fail)}</div><div class="kpi-l">${t('kpi_failed')}</div></div>`;
+    <div><div class="kpi-v" style="${m.kpis.fail ? 'color:var(--critical)' : ''}">${n(m.kpis.fail)}</div><div class="kpi-l">${t('kpi_failed')}</div></div>`
+    + (m.efficiency ? `<div class="kpi-l" style="flex-basis:100%;margin-top:-10px;text-transform:none">${esc(AW.effText(m.efficiency).share)} · ${esc(AW.effText(m.efficiency).cache)}</div>` : '');
 
   const c = m.claude;
   let ch = '';

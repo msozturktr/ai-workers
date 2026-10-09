@@ -175,11 +175,13 @@ def _model_breakdown(provider, rows_today, now, model_limits, free_limits=None):
         lim = model_limits.get(model) or {}
         free = (free_limits or {}).get(model) or {}
         last_min = [r for r in rs if r["ts"] >= now - 60]
-        tok_min = sum((r.get("in") or 0) + (r.get("out") or 0) for r in last_min)
+        tok_min = sum((r.get("in") or 0) + (r.get("out") or 0) + (r.get("think") or 0)
+                      for r in last_min)
         row = {
             "model": model,
             "requests_today": len(rs),
-            "tokens_today": sum((r.get("in") or 0) + (r.get("out") or 0) for r in rs),
+            "tokens_today": sum((r.get("in") or 0) + (r.get("out") or 0) + (r.get("think") or 0)
+                                for r in rs),
             "requests_last_min": len(last_min),
             "tokens_last_min": tok_min,
             "limits": lim or None,
@@ -227,6 +229,7 @@ def efficiency(rows):
     saved = sum((r.get("saved_in") or 0) + (r.get("saved_out") or 0) for r in hits)
     return {"jobs": jobs, "free": free, "gemini": gem, "cache_hits": len(hits),
             "tokens_saved": saved,
+            "think_tokens": sum(r.get("think") or 0 for r in real),
             "free_pct": round(free / jobs * 100) if jobs else 0}
 
 
@@ -254,6 +257,7 @@ def workers_usage():
             "today_failed": sum(1 for r in mine if not r.get("ok")),
             "today_tokens_in": sum(r.get("in") or 0 for r in mine),
             "today_tokens_out": sum(r.get("out") or 0 for r in mine),
+            "today_tokens_think": sum(r.get("think") or 0 for r in mine),
             "last_minute_requests": sum(1 for r in rows_min if r["provider"] == prov),
             "source": "local counter",
             "quota": None,
@@ -450,7 +454,9 @@ def format_report(snap):
         q = w.get("quota") or {}
         rq = q.get("requests") or {}
         bits = [f"today {w['today_requests']} requests",
-                f"{w['today_tokens_in']}+{w['today_tokens_out']} tokens"]
+                f"{w['today_tokens_in']}+{w['today_tokens_out']} tokens"
+                + (f" (+{_fmt_tok(w['today_tokens_think'])} thinking)"
+                   if w.get("today_tokens_think") else "")]
         if rq.get("limit"):
             pct = (rq["remaining"] / rq["limit"] * 100) if rq.get("remaining") is not None else None
             bits.insert(0, f"REMAINING {rq['remaining']}/{rq['limit']}"
@@ -475,7 +481,9 @@ def format_report(snap):
     if e:
         out += ["", "## Efficiency (today)",
                 f"- {e['jobs']} jobs: {e['free']} free ({e['free_pct']}%), {e['gemini']} gemini, "
-                f"{e['cache_hits']} cache hits ({_fmt_tok(e['tokens_saved'])} tokens saved)"]
+                f"{e['cache_hits']} cache hits ({_fmt_tok(e['tokens_saved'])} tokens saved)"
+                + (f"; {_fmt_tok(e['think_tokens'])} thinking tokens billed"
+                   if e.get("think_tokens") else "")]
     c = snap["claude"]
     live = c.get("live") or {}
     out += ["", "## Claude (live subscription limits)"]

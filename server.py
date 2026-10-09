@@ -181,13 +181,19 @@ def t_org_status(_a):
     for name, cfg in P.PROVIDERS.items():
         mark = "READY" if name in have else "NO KEY"
         lines.append(f"- {name}: {mark} (default: {cfg['default_model']}, light: {cfg['light_model']})")
+        for pm in cfg.get("pool") or []:
+            c = P._cooling(name, pm)
+            if c:
+                lines.append(f"  - pool {pm} [{c}]")
     if not have:
         lines += ["", f"No keys found. Add to {P.ENV_FILE} file:",
                   "  GEMINI_API_KEY=...", "  GROQ_API_KEY=...", "  OPENROUTER_API_KEY=..."]
     lines += ["", "## Roles"]
     for name, spec in roles.items():
         ready = "" if spec["provider"] in have else "  [provider not ready -> fallback will be used]"
-        lines.append(f"- {name}: {spec['provider']} / {spec['model']}{ready}")
+        cool = P._cooling(spec["provider"], spec["model"])
+        cool = f" [{cool}]" if cool else ""
+        lines.append(f"- {name}: {spec['provider']} / {spec['model']}{cool}{ready}")
     lines += ["", f"To edit roles: {P.CONFIG_FILE}"]
     return "\n".join(lines)
 
@@ -234,7 +240,7 @@ def t_delegate(a):
     shown = [x for x in res.get("route") or [] if x.get("error") != "busy"]
     if shown:
         head += f" (fallback: {_fb_summary(shown)})"
-    trunc = _TRUNC_NOTE if res.get("truncated") else ""
+    trunc = (_TRUNC_NOTE if res.get("truncated") else "") + (_INVALID_NOTE if res.get("warning_note") else "")
     if out_path:
         try:
             body = _saved(out_path, res["text"])
@@ -244,6 +250,7 @@ def t_delegate(a):
     return f"{head}\n\n{res['text']}{trunc}" + S.format_skipped(skipped)
 
 
+_INVALID_NOTE = "\n\n[WARNING: output is not valid JSON]"
 _TRUNC_NOTE = "\n\n[WARNING: response TRUNCATED at max_tokens limit - incomplete; increase max_tokens and try again]"
 
 
@@ -303,10 +310,7 @@ def _pack_prompt(task, pack):
 
 def _parse_pack(text):
     """-> {item number (str): answer text} or None when the reply is not a JSON object."""
-    t = (text or "").strip()
-    m = re.match(r"^```[a-zA-Z0-9]*\s*\n(.*?)\n?```\s*$", t, re.S)
-    if m:
-        t = m.group(1).strip()
+    t = P.strip_fence(text)
     try:
         d = json.loads(t)
     except ValueError:
@@ -331,7 +335,7 @@ def _render_compact(head, results):
         return None
     for _, r in goods:
         t = r.get("text") or ""
-        if r.get("truncated") or r.get("warning") or not t.strip() or "\n" in t.strip() or len(t.strip()) > 200:
+        if r.get("truncated") or r.get("warning") or r.get("warning_note") or not t.strip() or "\n" in t.strip() or len(t.strip()) > 200:
             return None
     from collections import Counter
     dom = Counter((j["role"], f"{r['provider']}/{r['model']}") for j, r in goods).most_common(1)[0][0]
@@ -456,7 +460,7 @@ def t_fanout(a):
         answers = _parse_pack(res.get("text"))
         if answers is None:
             return pack, {}
-        base = {k: v for k, v in res.items() if k not in ("text", "truncated", "warning")}
+        base = {k: v for k, v in res.items() if k not in ("text", "truncated", "warning", "warning_note")}
         return pack, {j["idx"]: {**base, "text": answers[str(n)]}
                       for n, j in enumerate(pack, 1) if str(n) in answers}
 
@@ -499,7 +503,7 @@ def t_fanout(a):
             f"## {j['label']}\n{r['text'] or '(empty response)'}" + (_TRUNC_NOTE if r.get("truncated") else "")
             for j, r in good)
         with T.span("job", label="reduce", role=reduce_role, task=T.blob(reduce_task)) as job:
-            rres = P.run(roles[reduce_role], _compose(reduce_task, joined), max_tokens=max_tok,
+            rres = P.run(roles[reduce_role], _compose(reduce_task, joined), max_tokens=None,  # map budget would truncate the merge
                          role=reduce_role, no_cache=no_cache)
             if rres.get("route"):
                 job.note("fallback", route=rres["route"])
@@ -550,7 +554,8 @@ def t_fanout(a):
                 out.append(f"- {j['label']} [{tag}] -> {os.path.basename(path)} ({n} chars)"
                            + (" TRUNCATED" if r.get("truncated") else ""))
                 continue
-            body = (r["text"] or "(empty response)") + (_TRUNC_NOTE if r.get("truncated") else "")
+            body = (r["text"] or "(empty response)") + (_TRUNC_NOTE if r.get("truncated") else "") \
+                + (_INVALID_NOTE if r.get("warning_note") else "")
             if r.get("warning"):
                 body = f"WARNING: {r['warning']}"
             out.append(f"\n## {j['label']} [{j['role']} -> {tag}]\n{body}")
@@ -698,6 +703,8 @@ def main():
         try:
             msg = json.loads(line)
         except json.JSONDecodeError:
+            continue
+        if not isinstance(msg, dict):  # valid JSON but not a JSON-RPC object
             continue
         mid, method = msg.get("id"), msg.get("method")
         try:

@@ -133,6 +133,7 @@ function overviewHTML() {
         <div class="counter"><span class="lbl-sm">${esc(U(t('mc_tok_today')))}</span><div class="nixie-tube"><span class="nixie-digit">${pad(m.kpis.tok, 6)}</span></div><span class="sub">${esc(U(t('mc_sub_inout')))}</span></div>
         <div class="counter fail"><span class="lbl-sm">${esc(U(t('mc_failed')))}</span><div class="nixie-tube"><span class="nixie-digit red">${pad(m.kpis.fail, 4)}</span></div><span class="sub">${esc(U(t('mc_sub_today')))}</span></div>
       </div>
+      ${m.efficiency ? `<div class="plate ov hero-caption" style="margin-top:6px">${esc(U(AW.effText(m.efficiency).share))}<br>${esc(U(AW.effText(m.efficiency).cache))}</div>` : ''}
     </section>
     <section class="bay col-7">${SCREWS4SM}
       <div class="bay-hdr"><div class="plate ov">${esc(U(t('mc_fd_hdr')))}</div><span class="dymo ov">MON-BAY-FDIR</span></div>

@@ -117,6 +117,7 @@ function overviewHTML() {
           ${tg ? `<span class="t-lbl-md c-pri" style="background:rgba(255,78,123,.2);padding:2px 8px;border:1px solid var(--primary-c);border-radius:4px">${esc(U(st.label))}</span>` : ''}</div>
         <p class="t-lbl-md c-var" style="margin:8px 0 0">${esc(label)}${tg && tg.resets ? ` · ${esc(t('resets_at', { t: '' }).trim())} <span class="c-sec" style="font-weight:600">${esc(tg.resets)}</span>` : ''}</p></div>
       <div class="kpis">
+        ${m.efficiency ? `<div class="kpi-pod" style="grid-column:1/-1;min-width:0"><span class="t-lbl-sm c-sec">${esc(AW.effText(m.efficiency).share)}</span><span class="t-lbl-sm c-var" style="margin-top:4px">${esc(AW.effText(m.efficiency).cache)}</span>${bar(m.efficiency.free_pct, 'bg-sec', '#6ff2ff')}</div>` : ''}
         <div class="kpi-pod"><span class="t-lbl-sm c-var up">${esc(U(t('sw_req_traffic')))}</span>
           <div class="row"><span class="t-h-lg c-on">${n(m.kpis.req)}</span><span class="t-lbl-sm c-sec">${esc(U(t('sw_today')))}</span></div>${bar(reqCap ? m.kpis.req / reqCap * 100 : 0, 'bg-sec', '#6ff2ff')}</div>
         <div class="kpi-pod"><span class="t-lbl-sm c-var up">${esc(U(t('sw_tok_consumption')))}</span>

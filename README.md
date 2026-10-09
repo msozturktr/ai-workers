@@ -364,6 +364,13 @@ Gemini model goes past its free-tier limits.
 - Mechanical roles (`classifier`, `translator`, `extractor`) and `summarizer` ask Groq's gpt-oss
   models for `reasoning_effort: low`, which cut reasoning tokens by ~60% in tests without hurting
   the answer (for `summarizer`: -22% output tokens, -30% latency).
+- Gemini 3.x flash models think by default and bill the hidden thinking tokens. Measured on a
+  10K-token input with `max_tokens` 4096: default 19.6 s with ~3,900 thinking tokens (the answer
+  was truncated), `reasoning_effort: low` 18.0 s, `none` 2.3 s with no thinking. So `summarizer`,
+  `translator`, `classifier` and `extractor` send `reasoning_effort: minimal` to Gemini (`none` is rejected by flash-lite; `minimal` also gives zero thinking) (and `low` to
+  Groq), `coder` sends `low` to Gemini, while `researcher` and `reviewer` keep thinking. A role's
+  `reasoning_effort` may be a string (Groq only) or a `{provider: effort}` object. Thinking tokens
+  are recorded in the ledger and shown in the usage report.
 - Results larger than 60K characters (Claude Code rejects tool results above ~25K tokens) are
   truncated; the full text is saved under `~/.config/ai-workers/results/` (newest 50 kept) and
   the path is returned so it can be condensed by a worker.
@@ -421,6 +428,12 @@ Contributions are welcome. Please keep the project dependency-free and add a tes
 behavior change.
 
 ## Changelog
+
+### 1.6.1
+
+- Per-provider `reasoning_effort` (`{provider: effort}`); mechanical roles send `minimal` to Gemini (19.6 s to 2.3 s, no hidden thinking tokens measured).
+- Thinking tokens recorded in the ledger and the usage report (counted in Gemini tpm accounting).
+- `extractor` JSON validation, flash-lite fallback for light roles, UI efficiency panel, `reduce` uses auto `max_tokens`.
 
 ### 1.6.0
 
