@@ -124,8 +124,11 @@ fanout(role="classifier", task="...", files=["~/code/myapp/src/**/*.py"])
 - **Never sent:** secret files (`.env*`, `*.pem`, `*.key`, `id_rsa*`, `credentials*`,
   `*secret*`, `~/.ssh`, `~/.config/ai-workers`, ...), binary files, files over 8 MB. Directory
   and glob scans skip `.git`, `node_modules`, `__pycache__`, `.venv`, `obj`, `bin`, `.next`, ...
-- **Input budgets** (`max_input_chars`): Groq 12K, OpenRouter 200K, Gemini 1.5M characters.
-  Input over a provider's budget moves to the next provider without a network call.
+- **Input budgets.** Groq's free tier allows ~8K tokens per minute and counts `max_tokens` up
+  front, so its input budget is computed per call: `(8000 − max_tokens) × 3.2` characters, capped
+  at 24K (about 21K characters with `max_tokens` 1200, 12K with the default 4096). OpenRouter
+  allows 200K and Gemini 1.5M characters. Input over a provider's budget moves to the next
+  provider without a network call, so **a smaller `max_tokens` keeps more work on free Groq**.
 
 ## Measured token savings
 
@@ -272,14 +275,15 @@ OPENROUTER_API_KEY=...    # https://openrouter.ai/keys
 
 | key      | meaning |
 |----------|---------|
-| `roles`  | override fields of a built-in role or add new roles (`provider`, `model`, `system`, `whole_files`) |
+| `roles`  | override fields of a built-in role or add new roles (`provider`, `model`, `system`, `whole_files`, `reasoning_effort`) |
 | `trace`  | activity log on/off, retention in days, size cap in MB |
 | `limits` | Gemini quotas per model (Gemini does not report them; copy them from AI Studio → Rate limits). `limits.gemini.free_tier_models` holds the free-tier limits for the "X/Y free remaining" hint |
 | `port`   | dashboard port (default 8765, or `AI_WORKERS_PORT`) |
 
 Other files in the directory are written by ai-workers: `ledger.jsonl` (one line per request:
 time, provider, model, role, tokens, error), `ratelimit.json` (latest Groq rate-limit headers),
-`claude_live.json` (cached Claude limits) and `trace/` (activity log).
+`claude_live.json` (cached Claude limits), `results/` (oversized tool results) and `trace/`
+(activity log).
 
 ## Quota tracking
 
@@ -307,8 +311,15 @@ Gemini model goes past its free-tier limits.
   failures.
 - When a role's provider fails (missing key, input too large, error), the job falls back to the
   other providers. In a `fanout`, one failing job never affects the others.
-- Groq's free tier allows 8K tokens/minute per model, so large parallel runs can hit 429 and
-  move to Gemini. `fanout` runs 4 jobs at a time by default; Groq handles up to 8.
+- Groq's per-minute token budget is tracked in the server: a request waits (up to 30 s) until
+  the last minute's usage leaves room for it instead of hitting 429 and falling back to paid
+  Gemini. The limit is learned from Groq's rate-limit headers. `fanout` runs 4 jobs at a time by
+  default.
+- Mechanical roles (`classifier`, `translator`, `extractor`) ask Groq's gpt-oss models for
+  `reasoning_effort: low`, which cut reasoning tokens by ~60% in tests without hurting the answer.
+- Results larger than 60K characters (Claude Code rejects tool results above ~25K tokens) are
+  truncated; the full text is saved under `~/.config/ai-workers/results/` (newest 50 kept) and
+  the path is returned so it can be condensed by a worker.
 - Groq requires a `User-Agent` header; without it Cloudflare answers HTTP 403 (error 1010).
 - Reasoning models spend tokens on thinking: with `max_tokens` below ~512 the answer can be
   empty, and ai-workers reports that as a warning. Truncated answers are flagged as well.

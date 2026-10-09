@@ -295,7 +295,7 @@ function termHTML(title, p, extra = '') {
 function attemptCardHTML(a) {
   if (!a) return '';
   const tok = a.tokens || {}, tab = AW.attemptTab(a);
-  const alerts = (a.notes || []).map(nt => `<div class="alert">${I.warn}<span>${esc(AW.noteText(nt))}${nt.error ? ' — ' + esc(String(nt.error).slice(0, 160)) : ''}</span></div>`).join('')
+  const alerts = (a.notes || []).map(nt => `<div class="alert">${I.warn}<span>${esc(AW.noteText(nt, a.provider))}${nt.error ? ' — ' + esc(String(nt.error).slice(0, 160)) : ''}</span></div>`).join('')
     + (a.status === 'skipped' ? `<div class="alert">${I.warn}<span>${esc(t('skipped_why', { e: a.error }))}</span></div>` : '')
     + (a.warning ? `<div class="alert pk">${I.warn}<span>${esc(a.warning)}</span></div>` : '')
     + (a.truncated ? `<div class="alert pk">${I.warn}<span>${esc(t('truncated_note', { n: a.max_tokens }))}</span></div>` : '');

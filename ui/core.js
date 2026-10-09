@@ -309,8 +309,9 @@ AW.attemptPayload = (a, tab) => {
   const txt = JSON.stringify(raw, null, 2);
   return { text: txt, size: txt.length };
 };
-AW.noteText = nt => nt.name === 'retry'
+AW.noteText = (nt, provider) => nt.name === 'retry'
   ? t('retry_note', { n: nt.attempt, why: nt.http ? t('http_n', { n: nt.http }) : t('error_word'), d: dfmt(nt.delay) })
+  : nt.name === 'throttle' ? t('throttle_note', { d: dfmt(nt.waited), p: provider || 'provider' })
   : nt.name === 'fallback' ? t('fallback_note', { p: nt.provider, next: (nt.next || []).join(', ') }) : `${nt.name}`;
 
 /* provider groups of a call for flow diagrams */

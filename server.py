@@ -3,7 +3,7 @@
 
 JSON-RPC over stdio. No external dependencies.
 """
-import json, os, sys, threading, traceback
+import json, os, secrets, sys, threading, time, traceback
 from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -13,14 +13,13 @@ import usage as U
 import sources as S
 
 PROTOCOL = "2025-06-18"
-SERVER = {"name": "ai-workers", "version": "1.4.0"}
+SERVER = {"name": "ai-workers", "version": "1.5.0"}
 
-INSTRUCTIONS = """ai-workers: worker model pool to save Claude's tokens (Groq/OpenRouter free, Gemini large-context).
-Default: don't do mechanical work yourself, delegate to worker -> bulk summary, translation, classification/labeling, log and output scanning, large file/directory summary, per-file repetitive analysis, draft text, regex/data transformation, boilerplate draft.
-DO NOT PASTE CONTENT: if working on files, pass ABSOLUTE path/glob/directory to the `files` parameter (e.g. ["~/code/myapp/src/**/*.py"]). The server reads the file itself; content never enters your context; you only receive the worker output. Reading a file first and then copying it to input is a waste of tokens.
-Single job -> delegate. N files / N chunks -> fanout (with files, each file becomes a separate job; large files are automatically chunked, inputs exceeding Groq limit automatically fallback to Gemini).
-Secret files (.env, keys, ~/.ssh ...) are automatically skipped. Worker output is an unverified draft: verify at critical points. Architectural decisions, critical code edits, tasks with security/data loss risks remain with you.
-If scanning command output (log, test output), write to a file in scratchpad first, then pass via files."""
+INSTRUCTIONS = """ai-workers: cheap worker models (Groq/OpenRouter free, Gemini for big inputs) for mechanical text work, so Claude's tokens go to thinking.
+Hand off: summaries, translation, classification, extraction, log/test-output scanning, per-file analysis, first-pass review, drafts.
+Keep: architecture, code edits, security/data-loss decisions, and verifying worker output (it is an unreviewed draft).
+Files: never Read-and-paste. Pass absolute paths/dirs/globs in `files`; the server reads them and skips secrets. Save command output to a file first.
+One job -> delegate. Many files/items -> fanout (one job per file). Set max_tokens to what the answer needs: smaller keeps larger inputs on free Groq."""
 
 ALWAYS = {"anthropic/alwaysLoad": True}
 
@@ -32,43 +31,43 @@ TOOLS = [
     },
     {
         "name": "delegate",
-        "description": "Delegate a single task to a worker model (role = provider + model + system prompt). Do not paste content for file work: provide absolute path/glob via `files`, server reads it directly (saves tokens). If the role's provider errors or exceeds input limit, automatically falls back to others. Use fanout if there are many tasks/files.",
+        "description": "Run one job on a worker model (role = provider + model + prompt, see org_status). Pass file content via `files`, never pasted. Falls back to other providers automatically.",
         "_meta": ALWAYS,
         "inputSchema": {
             "type": "object",
             "properties": {
-                "role": {"type": "string", "description": "A role name from org_status: researcher, summarizer, coder, reviewer, translator, classifier, extractor"},
-                "task": {"type": "string", "description": "Clear instruction for the worker. State clearly what you want and the output format."},
-                "input": {"type": "string", "description": "Short data/text to work on (optional). Use files instead of this for file content."},
+                "role": {"type": "string", "description": "researcher | summarizer | coder | reviewer | translator | classifier | extractor"},
+                "task": {"type": "string", "description": "Instruction, including the output format."},
+                "input": {"type": "string", "description": "Short inline data; use files for file content."},
                 "files": {"type": "array", "items": {"type": "string"},
-                          "description": "List of absolute file paths, directories, or globs (~ supported). Server reads and passes all as a single input to the worker. Secret/binary files are skipped."},
-                "model": {"type": "string", "description": "Override default model of the role (optional)."},
-                "max_tokens": {"type": "integer", "description": "Default 4096."},
-                "no_fallback": {"type": "boolean", "description": "If true, only tries the role's own provider."},
+                          "description": "Absolute paths, dirs or globs (~ ok), merged into one input."},
+                "model": {"type": "string", "description": "Override the role's model."},
+                "max_tokens": {"type": "integer", "description": "Answer budget (default 4096). Lower is cheaper and keeps larger inputs on Groq."},
+                "no_fallback": {"type": "boolean", "description": "Only try the role's own provider."},
             },
             "required": ["role", "task"],
         },
     },
     {
         "name": "fanout",
-        "description": "Distribute tasks in parallel to worker pool. Use this for N-part jobs like bulk summarization, translation, classification, per-file analysis - do not call delegate one by one. If `files` is given, each file becomes a separate job (large files automatically chunked); content does not enter your context.",
+        "description": "Run many jobs in parallel (one per item or per file) instead of repeated delegate calls. File content never enters your context.",
         "_meta": ALWAYS,
         "inputSchema": {
             "type": "object",
             "properties": {
-                "role": {"type": "string", "description": "Default role for all tasks."},
-                "task": {"type": "string", "description": "Default instruction for all tasks."},
+                "role": {"type": "string", "description": "Default role."},
+                "task": {"type": "string", "description": "Default instruction."},
                 "items": {
                     "type": "array",
-                    "description": "Task list. Each item is either plain text (used as input) or a {input, task?, role?, model?, label?} object.",
+                    "description": "Strings (used as input) or {input, task?, role?, model?, label?}.",
                     "items": {"type": ["string", "object"]},
                 },
                 "files": {"type": "array", "items": {"type": "string"},
-                          "description": "List of absolute paths/directories/globs. Each file (or chunk of a large file) becomes a separate task with shared role+task. Can be used together with items."},
-                "chunk_chars": {"type": "integer", "description": "Chunk size for files (characters). Default: based on role's provider limit (Groq ~11K, Gemini 200K)."},
-                "whole_files": {"type": "boolean", "description": "true: do not chunk files, send whole (files exceeding Groq fallback to Gemini). Default is true in summarizer/researcher/reviewer; out-of-context chunks hallucinate summaries."},
-                "concurrency": {"type": "integer", "description": "Number of concurrent requests. Default 4 for free tier rate-limits; can go up to 8 on Groq."},
-                "max_tokens": {"type": "integer"},
+                          "description": "Absolute paths/dirs/globs; one job per file (large files chunked unless whole_files)."},
+                "chunk_chars": {"type": "integer", "description": "Chunk size; default fits the provider budget."},
+                "whole_files": {"type": "boolean", "description": "Never chunk files (default for summarizer, researcher, reviewer)."},
+                "concurrency": {"type": "integer", "description": "Parallel requests (default 4; Groq handles up to 8)."},
+                "max_tokens": {"type": "integer", "description": "Answer budget per job (default 4096)."},
             },
             "required": [],
         },
@@ -143,7 +142,8 @@ def t_delegate(a):
         return f"ERROR: role '{role}' does not exist. Available roles: {', '.join(roles)}"
     spec = roles[role]
     kw = dict(system=spec.get("system"), model=a.get("model") or spec.get("model"),
-              max_tokens=a.get("max_tokens", 4096), role=role)
+              max_tokens=a.get("max_tokens", 4096), role=role,
+              reasoning_effort=spec.get("reasoning_effort"))
     data, nfiles, skipped = a.get("input"), 0, []
     if a.get("files"):
         text, nfiles, skipped, err = S.bundle(a["files"])
@@ -210,8 +210,7 @@ def t_fanout(a):
     if a.get("files"):
         if default_role not in roles or not default_task:
             return "ERROR: shared 'role' (valid) and 'task' are required with files."
-        prov = P.PROVIDERS.get(roles[default_role]["provider"]) or {}
-        budget = prov.get("max_input_chars", 200_000) - len(default_task) \
+        budget = P.input_budget(roles[default_role]["provider"], max_tok) - len(default_task) \
             - len(roles[default_role].get("system") or "") - 500
         whole = a.get("whole_files", roles[default_role].get("whole_files", False))
         if whole:
@@ -256,13 +255,15 @@ def t_fanout(a):
                     task=T.blob(j["task"])) as job:
             res = P.chat(spec["provider"], _compose(j["task"], j["input"]),
                          system=spec.get("system"), model=j["model"] or spec.get("model"),
-                         max_tokens=max_tok, role=j["role"])
+                         max_tokens=max_tok, role=j["role"],
+                         reasoning_effort=spec.get("reasoning_effort"))
             if not res["ok"]:
                 order = [p for p in P.FALLBACK_ORDER if p != spec["provider"]]
                 job.note("fallback", provider=spec["provider"], error=res.get("error"), next=order)
                 alt = P.chat_with_fallback(order, _compose(j["task"], j["input"]),
                                            system=spec.get("system"), max_tokens=max_tok,
-                                           role=j["role"])
+                                           role=j["role"],
+                                           reasoning_effort=spec.get("reasoning_effort"))
                 if alt.get("ok"):
                     alt["fallback_from"] = spec["provider"]
                     res = alt
@@ -359,11 +360,43 @@ def _status_of(text):
     return "ok"
 
 
+MAX_RESULT_CHARS = 60_000   # Claude Code rejects MCP tool results above ~25K tokens
+KEEP_RESULTS = 50
+RESULTS_DIR = os.path.join(P.CONFIG_DIR, "results")
+
+
+def _spill(name, text):
+    """Save an oversized result to RESULTS_DIR (newest KEEP_RESULTS kept); returns the path."""
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    path = os.path.join(RESULTS_DIR, f"{time.strftime('%Y%m%d-%H%M%S')}-{name}-{secrets.token_hex(3)}.md")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    try:
+        old = sorted(n for n in os.listdir(RESULTS_DIR) if n.endswith(".md"))[:-KEEP_RESULTS]
+        for n in old:
+            try:
+                os.remove(os.path.join(RESULTS_DIR, n))
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return path
+
+
 def invoke(name, args):
     """Run a tool and record it as one activity call (shared by MCP and the CLI)."""
     with T.span("call", tool=name, title=_title(name, args), args=_args_for_log(args)) as call:
         text = HANDLERS[name](args)
         call.set(status=_status_of(text), result=T.blob(text))
+        if len(text) > MAX_RESULT_CHARS:
+            try:
+                path = _spill(name, text)
+            except OSError as e:
+                path = f"(could not save: {e})"
+            text = (text[:MAX_RESULT_CHARS]
+                    + f"\n\n[ai-workers: result truncated \u2014 {len(text)} characters in total. "
+                      f"Full result: {path} (pass it in `files` to a worker to condense it, "
+                      "or read it in parts).]")
         return text
 
 

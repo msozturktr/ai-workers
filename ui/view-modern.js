@@ -238,7 +238,7 @@ function flowHTML(d) {
 function attemptHTML(a) {
   const tok = a.tokens || {}, tab = AW.attemptTab(a);
   const rl = a.ratelimit ? Object.entries(a.ratelimit).filter(([, v]) => v != null).map(([k, v]) => `${k.replace(/_/g, ' ')} ${v}`).join(' · ') : '';
-  const notes = (a.notes || []).map(nt => `<div>${esc(AW.noteText(nt))}<br><span style="color:var(--muted)">${esc(String(nt.error || '').slice(0, 300))}</span></div>`).join('')
+  const notes = (a.notes || []).map(nt => `<div>${esc(AW.noteText(nt, a.provider))}<br><span style="color:var(--muted)">${esc(String(nt.error || '').slice(0, 300))}</span></div>`).join('')
     + (a.status === 'skipped' ? `<div>${esc(t('skipped_why', { e: a.error }))}</div>` : '')
     + (a.warning ? `<div class="err">${esc(a.warning)}</div>` : '') + (a.truncated ? `<div class="err">${t('truncated_note', { n: a.max_tokens })}</div>` : '');
   const p = AW.attemptPayload(a, tab);

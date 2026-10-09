@@ -340,7 +340,7 @@ function stageHTML(d) {
     const tok = a.tokens || {};
     head = `<span><b>${esc(U(t('mc_station', { p: '' })) + UD(a.provider))}</b> · ${esc(a.model || '')} · <span class="${a.status === 'ok' ? 'text-green' : a.status === 'running' ? 'text-amber' : 'text-red'}">${esc(callWord(a.status))}</span></span>
       <span class="text-dim">${esc([a.finish_reason ? UD(t('finish', { r: a.finish_reason })) : null, a.status === 'running' ? null : UD(dfmt(a.dur)), tok.in || tok.out ? `${tok.in || 0}→${tok.out || 0} TOK` : null].filter(Boolean).join(' · '))}</span>`;
-    for (const nt of a.notes || []) notes += `<div class="caution-strip"><span class="lamp dot red"></span><span><b>${esc(UD(AW.noteText(nt)))}</b></span></div>`;
+    for (const nt of a.notes || []) notes += `<div class="caution-strip"><span class="lamp dot red"></span><span><b>${esc(UD(AW.noteText(nt, a.provider)))}</b></span></div>`;
     if (a.status === 'skipped') notes += `<div class="caution-strip amber"><span class="lamp dot amber"></span><span>${esc(UD(t('skipped_why', { e: a.error })))}</span></div>`;
     if (a.warning) notes += `<div class="caution-strip"><span class="lamp dot red"></span><span>${esc(a.warning)}</span></div>`;
     if (a.truncated) notes += `<div class="caution-strip amber"><span class="lamp dot amber"></span><span>${esc(UD(t('truncated_note', { n: a.max_tokens })))}</span></div>`;

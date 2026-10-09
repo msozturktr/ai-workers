@@ -16,9 +16,23 @@ SECRET_NAMES = [".env", ".env.*", "*.env", "*.pem", "*.key", "*.p12", "*.pfx", "
                 "id_rsa*", "id_ed25519*", "id_ecdsa*", "id_dsa*", "*.keystore", "*.jks",
                 ".netrc", ".npmrc", ".pypirc", "credentials*", "*secret*", "*.gpg",
                 ".git-credentials", "auth.json", "token*.json"]
-SECRET_DIRS = [os.path.join(HOME, d) for d in
-               (".ssh", ".gnupg", ".aws", ".kube", ".docker",
-                ".config/ai-workers", ".config/gh", ".password-store")]
+_SECRET_SUBDIRS = (".ssh", ".gnupg", ".aws", ".kube", ".docker",
+                   ".config/ai-workers", ".config/gh", ".password-store")
+
+
+def _secret_dirs(home):
+    """Secret directories under `home`, both as written and symlink-resolved
+    (_is_secret compares realpaths, so a symlinked home must not hide them)."""
+    out = []
+    for d in _SECRET_SUBDIRS:
+        p = os.path.join(home, d)
+        for form in (p, os.path.realpath(p)):
+            if form not in out:
+                out.append(form)
+    return out
+
+
+SECRET_DIRS = _secret_dirs(HOME)
 
 MAX_FILES = 300
 MAX_FILE_BYTES = 8_000_000
@@ -64,17 +78,23 @@ def resolve(patterns):
                 continue  # silently skip node_modules etc.
             elif _is_secret(m):
                 skipped.append({"path": m, "reason": "secret file (not sent)"})
-            elif os.path.getsize(m) > MAX_FILE_BYTES:
-                skipped.append({"path": m, "reason": f"> {MAX_FILE_BYTES // 1_000_000} MB"})
             else:
-                files.append(m)
+                try:
+                    too_big = os.path.getsize(m) > MAX_FILE_BYTES
+                except OSError:
+                    skipped.append({"path": m, "reason": "unreadable"})
+                    continue
+                if too_big:
+                    skipped.append({"path": m, "reason": f"> {MAX_FILE_BYTES // 1_000_000} MB"})
+                else:
+                    files.append(m)
             if len(files) > MAX_FILES:
                 return [], skipped, f"too many files (> {MAX_FILES}); narrow the glob"
     return files, skipped, None
 
 
 def read_text(path):
-    """Read text file; None if binary."""
+    """Read text file; None if binary. Raises OSError if unreadable."""
     with open(path, "rb") as f:
         raw = f.read()
     if b"\x00" in raw[:8192]:
@@ -103,12 +123,18 @@ def chunk(text, size):
 def common_root(files):
     if not files:
         return ""
-    root = os.path.commonpath(files)
+    try:
+        root = os.path.commonpath(files)
+    except ValueError:  # e.g. different Windows drives
+        return ""
     return root if os.path.isdir(root) else os.path.dirname(root)
 
 
 def label(path, root):
-    rel = os.path.relpath(path, root) if root else path
+    try:
+        rel = os.path.relpath(path, root) if root else path
+    except ValueError:
+        return path
     return rel if not rel.startswith("..") else path
 
 
@@ -123,7 +149,11 @@ def bundle(patterns):
     root = common_root(files)
     blocks = []
     for fp in files:
-        text = read_text(fp)
+        try:
+            text = read_text(fp)
+        except OSError:
+            skipped.append({"path": fp, "reason": "unreadable"})
+            continue
         if text is None:
             skipped.append({"path": fp, "reason": "binary file"})
             continue
@@ -142,7 +172,11 @@ def items(patterns, chunk_chars):
     root = common_root(files)
     out = []
     for fp in files:
-        text = read_text(fp)
+        try:
+            text = read_text(fp)
+        except OSError:
+            skipped.append({"path": fp, "reason": "unreadable"})
+            continue
         if text is None:
             skipped.append({"path": fp, "reason": "binary file"})
             continue

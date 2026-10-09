@@ -46,9 +46,18 @@ def parse_claude_usage(text):
             "raw_lines": [l for l in (x.strip() for x in t.splitlines()) if l][:14]}
 
 
+def _num(v):
+    """float(v), or 0 if it is not numeric."""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _read_live_cache():
     try:
-        return json.load(open(CLAUDE_LIVE_CACHE))
+        with open(CLAUDE_LIVE_CACHE) as f:
+            return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return None
 
@@ -115,7 +124,8 @@ def claude_live(max_age=CLAUDE_LIVE_TTL, block_if_empty=False):
 
 def _cfg():
     try:
-        return json.load(open(P.CONFIG_FILE))
+        with open(P.CONFIG_FILE) as f:
+            return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
 
@@ -138,7 +148,8 @@ def _ledger(since=None):
 
 def _snapshot():
     try:
-        return json.load(open(P.RATELIMIT_SNAPSHOT))
+        with open(P.RATELIMIT_SNAPSHOT) as f:
+            return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
 
@@ -306,29 +317,30 @@ def claude_usage():
     last_quota = None
     for fp in today_files:
         try:
-            for line in open(fp, errors="replace"):
-                if '"usage"' not in line and '"quotaLimits"' not in line:
-                    continue
-                try:
-                    m = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                q = m.get("quotaLimits")
-                if isinstance(q, dict) and q.get("resetsAt"):
-                    if not last_quota or q["resetsAt"] > last_quota.get("resetsAt", 0):
-                        last_quota = {**q, "file": os.path.basename(fp)}
-                msg = m.get("message") or {}
-                u = msg.get("usage") or m.get("usage")
-                if isinstance(u, dict):
-                    model = msg.get("model") or m.get("model") or "unknown"
-                    d = by_model.setdefault(model, {"in": 0, "out": 0, "cache_read": 0,
-                                                    "cache_write": 0, "calls": 0})
-                    d["in"] += u.get("input_tokens") or 0
-                    d["out"] += u.get("output_tokens") or 0
-                    d["cache_read"] += u.get("cache_read_input_tokens") or 0
-                    d["cache_write"] += u.get("cache_creation_input_tokens") or 0
-                    d["calls"] += 1
-                    sessions.add(fp)
+            with open(fp, errors="replace") as fh:
+                for line in fh:
+                    if '"usage"' not in line and '"quotaLimits"' not in line:
+                        continue
+                    try:
+                        m = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    q = m.get("quotaLimits")
+                    if isinstance(q, dict) and q.get("resetsAt"):
+                        if not last_quota or _num(q["resetsAt"]) > _num(last_quota.get("resetsAt")):
+                            last_quota = {**q, "file": os.path.basename(fp)}
+                    msg = m.get("message") or {}
+                    u = msg.get("usage") or m.get("usage")
+                    if isinstance(u, dict):
+                        model = msg.get("model") or m.get("model") or "unknown"
+                        d = by_model.setdefault(model, {"in": 0, "out": 0, "cache_read": 0,
+                                                        "cache_write": 0, "calls": 0})
+                        d["in"] += u.get("input_tokens") or 0
+                        d["out"] += u.get("output_tokens") or 0
+                        d["cache_read"] += u.get("cache_read_input_tokens") or 0
+                        d["cache_write"] += u.get("cache_creation_input_tokens") or 0
+                        d["calls"] += 1
+                        sessions.add(fp)
         except OSError:
             continue
 
@@ -336,16 +348,17 @@ def claude_usage():
     if last_quota is None:
         for fp in sorted(files, key=os.path.getmtime, reverse=True)[:40]:
             try:
-                for line in open(fp, errors="replace"):
-                    if '"quotaLimits"' not in line:
-                        continue
-                    try:
-                        q = (json.loads(line) or {}).get("quotaLimits")
-                    except json.JSONDecodeError:
-                        continue
-                    if isinstance(q, dict) and q.get("resetsAt"):
-                        if not last_quota or q["resetsAt"] > last_quota.get("resetsAt", 0):
-                            last_quota = {**q, "file": os.path.basename(fp)}
+                with open(fp, errors="replace") as fh:
+                    for line in fh:
+                        if '"quotaLimits"' not in line:
+                            continue
+                        try:
+                            q = (json.loads(line) or {}).get("quotaLimits")
+                        except json.JSONDecodeError:
+                            continue
+                        if isinstance(q, dict) and q.get("resetsAt"):
+                            if not last_quota or _num(q["resetsAt"]) > _num(last_quota.get("resetsAt")):
+                                last_quota = {**q, "file": os.path.basename(fp)}
             except OSError:
                 continue
             if last_quota:
@@ -449,7 +462,7 @@ def format_report(snap):
     q = None if (live.get("ok") and live.get("limits")) else c.get("last_quota_event")
     if q:
         import datetime
-        ts = datetime.datetime.fromtimestamp(q["resetsAt"])
+        ts = datetime.datetime.fromtimestamp(_num(q["resetsAt"]))
         past = ts < datetime.datetime.now()
         out.append(f"- last limit event: {q.get('rateLimitType')} / {q.get('status')}, "
                    f"resets {ts:%Y-%m-%d %H:%M}" + (" (PAST, not up to date)" if past else ""))

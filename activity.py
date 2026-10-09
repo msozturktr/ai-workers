@@ -107,9 +107,9 @@ def blob(text):
     digest = hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()
     path = os.path.join(BLOB_DIR, digest)
     try:
-        if os.path.exists(path):
+        try:
             os.utime(path)  # still in use: keep it out of age-based pruning
-        else:
+        except FileNotFoundError:  # new, or pruned meanwhile
             os.makedirs(BLOB_DIR, exist_ok=True)
             tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
             with open(tmp, "w", encoding="utf-8") as f:

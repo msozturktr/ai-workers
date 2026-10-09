@@ -29,7 +29,8 @@ DEFAULT_PORT = 8765
 
 def port():
     try:
-        cfg = json.load(open(P.CONFIG_FILE))
+        with open(P.CONFIG_FILE) as f:
+            cfg = json.load(f)
         return int(cfg.get("port") or os.environ.get("AI_WORKERS_PORT") or DEFAULT_PORT)
     except Exception:
         return int(os.environ.get("AI_WORKERS_PORT") or DEFAULT_PORT)
@@ -273,7 +274,8 @@ def cmd_doctor(a):
 
     # MCP registration
     try:
-        cj = json.load(open(os.path.expanduser("~/.claude.json")))
+        with open(os.path.expanduser("~/.claude.json")) as f:
+            cj = json.load(f)
         reg = "ai-workers" in (cj.get("mcpServers") or {})
     except Exception:
         reg = False

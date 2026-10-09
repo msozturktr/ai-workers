@@ -28,7 +28,7 @@ UI_DIR = os.path.join(HERE, "ui")
 PAGE = os.path.join(UI_DIR, "index.html")
 UI_TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
             ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml"}
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 ALLOWED_HOSTS = {"127.0.0.1", "localhost", "[::1]"}
 
 
@@ -71,10 +71,15 @@ def _storage_bytes():
     return _STORAGE["bytes"]
 
 
+_ACT_LOCK = threading.Lock()
+
+
 def _activity():
     global ACT
     if ACT is None:
-        ACT = Activity()
+        with _ACT_LOCK:
+            if ACT is None:
+                ACT = Activity()
     return ACT
 
 

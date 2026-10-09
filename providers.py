@@ -3,7 +3,7 @@ import json, os, threading, time, urllib.request, urllib.error
 
 import activity as T
 
-UA = "ai-workers/1.4 (+https://github.com/msozturktr/ai-workers) python-urllib"
+UA = "ai-workers/1.5 (+https://github.com/msozturktr/ai-workers) python-urllib"
 
 CONFIG_DIR = os.path.expanduser("~/.config/ai-workers")
 ENV_FILE = os.path.join(CONFIG_DIR, "env")
@@ -42,9 +42,11 @@ PROVIDERS = {
         "key_env": ["GROQ_API_KEY"],
         "default_model": "openai/gpt-oss-120b",
         "light_model": "openai/gpt-oss-20b",
-        # free tier 8K tokens/min per model (input+output); ~3-4K token input
-        # ensures parallel jobs fit within the same minute -> small tasks
-        "max_input_chars": 12_000,
+        # free tier 8K tokens/min per model; Groq counts max_tokens up front, so the real
+        # input budget is derived per call by input_budget(); this is only the hard cap.
+        "tpm": 8000,
+        "reasoning": True,  # gpt-oss models accept reasoning_effort
+        "max_input_chars": 24_000,
     },
     "openrouter": {
         "url": "https://openrouter.ai/api/v1/chat/completions",
@@ -69,11 +71,11 @@ DEFAULT_ROLES = {
     "reviewer":    {"provider": "openrouter", "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
                     "whole_files": True,
                     "system": "You are a code/text reviewer. List only concrete, verifiable defects. For each: where, why it is wrong, how it is triggered. If there are none, say there are no findings."},
-    "translator":  {"provider": "groq", "model": "openai/gpt-oss-120b",
+    "translator":  {"provider": "groq", "model": "openai/gpt-oss-120b", "reasoning_effort": "low",
                     "system": "Translate the given text into the requested language. Translate every word of natural language; keep code, identifiers, file paths, URLs and formatting unchanged. No explanations; return only the translation."},
-    "classifier":  {"provider": "groq", "model": "openai/gpt-oss-20b",
+    "classifier":  {"provider": "groq", "model": "openai/gpt-oss-20b", "reasoning_effort": "low",
                     "system": "You are a classifier. Return only the requested label and nothing else."},
-    "extractor":   {"provider": "groq", "model": "openai/gpt-oss-120b",
+    "extractor":   {"provider": "groq", "model": "openai/gpt-oss-120b", "reasoning_effort": "low",
                     "system": "Extract the requested fields from the text and return them as valid JSON. Use null for missing fields. Output nothing but JSON."},
 }
 
@@ -107,6 +109,94 @@ def load_roles():
     for spec in roles.values():
         spec["system"] = f"{spec.get('system') or ''}\n\n{LANGUAGE_RULE}".strip()
     return roles
+
+
+# Conservative chars-per-token estimate for mixed code/prose (real ratio is ~3.5-4;
+# a low value overestimates tokens, which is the safe side for rate limits).
+CHARS_PER_TOKEN = 3.2
+
+_learned_tpm = {}
+_learned_lock = threading.Lock()
+
+
+def _learn_tpm(provider, model, headers):
+    """Remember the tokens-per-minute limit the provider reported for this model."""
+    try:
+        v = int(float(_rl_from_headers(headers).get("limit-tokens")))
+    except (TypeError, ValueError):
+        return
+    if v > 0:
+        with _learned_lock:
+            _learned_tpm[(provider, model)] = v
+
+
+def tpm_limit(provider, model=None):
+    """Tokens-per-minute limit: learned from headers, else configured, else None."""
+    with _learned_lock:
+        v = _learned_tpm.get((provider, model))
+    return v or (PROVIDERS.get(provider) or {}).get("tpm")
+
+
+def input_budget(provider, max_tokens, model=None):
+    """Max input characters (prompt + system) a call may use, given max_tokens."""
+    cfg = PROVIDERS.get(provider)
+    if not cfg:
+        return 0
+    tpm = tpm_limit(provider, model or cfg.get("default_model"))
+    if not tpm:
+        return cfg["max_input_chars"]
+    return min(cfg["max_input_chars"],
+               max(0, int((tpm - max_tokens - 200) * CHARS_PER_TOKEN)))
+
+
+_tpm_windows = {}
+_tpm_lock = threading.Lock()
+TPM_MAX_WAIT = 30.0
+
+
+def _tpm_acquire(key, need, limit, now=time.time, sleep=time.sleep):
+    """Reserve `need` tokens in the 60 s sliding window for `key`; sleeps while the window
+    is full (at most TPM_MAX_WAIT in total, then proceeds anyway). Returns seconds waited."""
+    cap = 0.95 * limit
+    waited = 0.0
+    while True:
+        with _tpm_lock:
+            t = now()
+            win = _tpm_windows.setdefault(key, [])
+            win[:] = [e for e in win if e[0] > t - 60]
+            total = sum(e[1] for e in win)
+            wait = 0.0
+            if total + need > cap and waited < TPM_MAX_WAIT:
+                for ts, tok in win:  # oldest first
+                    total -= tok
+                    wait = ts + 60 - t
+                    if total + need <= cap:
+                        break
+                wait = min(max(wait, 0.0) + 0.05, TPM_MAX_WAIT - waited)
+            if wait <= 0:
+                win.append([t, need])
+                return waited
+        sleep(wait)
+        waited += wait
+
+
+def _tpm_release(key, need):
+    """Drop the newest reservation of `need` tokens (the request was rejected)."""
+    with _tpm_lock:
+        win = _tpm_windows.get(key, [])
+        for i in range(len(win) - 1, -1, -1):
+            if win[i][1] == need:
+                del win[i]
+                return
+
+
+def _tpm_settle(key, need, actual):
+    """Replace the newest reservation of `need` tokens with the actual usage."""
+    with _tpm_lock:
+        for e in reversed(_tpm_windows.get(key, [])):
+            if e[1] == need:
+                e[1] = actual
+                return
 
 
 def api_key(provider):
@@ -171,12 +261,15 @@ def _record_unlocked(provider, model, role, res, headers):
         rl = _rl_from_headers(headers)
         if rl:
             try:
-                snap = json.load(open(RATELIMIT_SNAPSHOT))
+                with open(RATELIMIT_SNAPSHOT) as f:
+                    snap = json.load(f)
             except (FileNotFoundError, json.JSONDecodeError):
                 snap = {}
             snap[provider] = {"ts": row["ts"], "model": model, **rl}
-            with open(RATELIMIT_SNAPSHOT, "w") as f:
+            tmp = f"{RATELIMIT_SNAPSHOT}.{os.getpid()}.{threading.get_ident()}.tmp"
+            with open(tmp, "w") as f:
                 json.dump(snap, f, indent=2)
+            os.replace(tmp, RATELIMIT_SNAPSHOT)
     except Exception:
         pass  # measurement should never break execution
 
@@ -191,7 +284,7 @@ def _retry_delay(headers, attempt):
 
 
 def chat(provider, prompt, system=None, model=None, max_tokens=4096,
-         temperature=0.2, retries=4, timeout=180, role=None):
+         temperature=0.2, retries=4, timeout=180, role=None, reasoning_effort=None):
     """Single worker call. Backs off and retries on rate-limit/5xx conditions.
 
     Never raises an exception: if no key, unknown provider, or input exceeds provider
@@ -201,9 +294,10 @@ def chat(provider, prompt, system=None, model=None, max_tokens=4096,
     cfg = PROVIDERS.get(provider) or {}
     with T.span("attempt", provider=provider, model=model or cfg.get("default_model"),
                 role=role, max_tokens=max_tokens, temperature=temperature,
+                reasoning_effort=reasoning_effort,
                 system=T.blob(system), prompt=T.blob(prompt)) as sp:
         res = _chat(sp, provider, prompt, system, model, max_tokens, temperature,
-                    retries, timeout, role)
+                    retries, timeout, role, reasoning_effort)
         tok = res.get("tokens")
         sp.set(status="ok" if res.get("ok") else ("skipped" if res.get("skipped") else "error"),
                model=res.get("model") or model or cfg.get("default_model"),
@@ -213,7 +307,18 @@ def chat(provider, prompt, system=None, model=None, max_tokens=4096,
         return res
 
 
-def _chat(sp, provider, prompt, system, model, max_tokens, temperature, retries, timeout, role):
+def _build_payload(provider, model, msgs, max_tokens, temperature, reasoning_effort=None):
+    """Request body; reasoning_effort is sent only to providers/models that accept it."""
+    payload = {"model": model, "messages": msgs, "max_tokens": max_tokens,
+               "temperature": temperature}
+    if (reasoning_effort and PROVIDERS[provider].get("reasoning")
+            and str(model).startswith("openai/gpt-oss")):
+        payload["reasoning_effort"] = reasoning_effort
+    return payload
+
+
+def _chat(sp, provider, prompt, system, model, max_tokens, temperature, retries, timeout, role,
+          reasoning_effort=None):
     if provider not in PROVIDERS:
         return {"ok": False, "skipped": True, "provider": provider, "model": model,
                 "error": f"unknown provider: {provider}"}
@@ -223,26 +328,37 @@ def _chat(sp, provider, prompt, system, model, max_tokens, temperature, retries,
         return {"ok": False, "skipped": True, "provider": provider, "model": model,
                 "error": f"missing key ({ENV_FILE} -> {cfg['key_env'][0]}=...)"}
     size = len(prompt) + len(system or "")
-    if size > cfg["max_input_chars"]:
+    budget = input_budget(provider, max_tokens, model or cfg["default_model"])
+    if size > budget:
         return {"ok": False, "skipped": True, "provider": provider, "model": model,
-                "error": f"input too large: {size} characters > {provider} limit "
-                         f"{cfg['max_input_chars']}"}
+                "error": f"input too large: {size} characters > {provider} budget "
+                         f"{budget} (max_tokens {max_tokens})"}
     msgs = ([{"role": "system", "content": system}] if system else []) + \
            [{"role": "user", "content": prompt}]
-    payload = {
-        "model": model or cfg["default_model"],
-        "messages": msgs,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-    }
+    retries = max(1, retries)
+    payload = _build_payload(provider, model or cfg["default_model"], msgs, max_tokens,
+                             temperature, reasoning_effort)
     last = None
+    tpm = tpm_limit(provider, payload["model"])
+    tkey = (provider, payload["model"])
+    need = size / CHARS_PER_TOKEN + max_tokens
+    reserved = False
     for attempt in range(retries):
         try:
+            if tpm and not reserved:  # one reservation per call (re-acquired after a 429)
+                reserved = True
+                waited = _tpm_acquire(tkey, need, tpm)
+                if waited > 0.5:
+                    sp.note("throttle", waited=round(waited, 1), need=int(need))
             data, hdrs = _post(cfg["url"], key, payload, timeout)
             if data.get("error") and not data.get("choices"):
                 # OpenRouter returns some upstream errors in the HTTP 200 body
                 err = data["error"]
                 code = err.get("code") if isinstance(err, dict) else None
+                try:
+                    code = int(code)
+                except (TypeError, ValueError):
+                    pass
                 last = f"HTTP 200 body error {code}: {json.dumps(err, ensure_ascii=False)[:600]}"
                 if code in (408, 429, 500, 502, 503, 504) and attempt < retries - 1:
                     delay = min(2 ** attempt * 2, 20)
@@ -266,12 +382,20 @@ def _chat(sp, provider, prompt, system, model, max_tokens, temperature, retries,
                 # text exists but was cut off at max_tokens -> caller should know output is truncated
                 "truncated": bool(text.strip()) and choice.get("finish_reason") == "length",
             }
+            _learn_tpm(provider, payload["model"], hdrs)
+            if tpm and usage.get("prompt_tokens") is not None:
+                # Groq charges max_tokens up front, so keep it reserved; only the input
+                # estimate is corrected to the real prompt size.
+                _tpm_settle(tkey, need, (usage.get("prompt_tokens") or 0) + max_tokens)
             _record(provider, payload["model"], role, res, hdrs)
             sp.set(ratelimit=_rl_from_headers(hdrs) or None, tries=attempt + 1)
             return res
         except urllib.error.HTTPError as e:
             detail = e.read().decode()[:600]
             last = f"HTTP {e.code}: {detail}"
+            if e.code == 429 and tpm and reserved:
+                _tpm_release(tkey, need)  # rejected requests are not charged; the retry
+                reserved = False          # must wait for room in the window again
             if e.code in (408, 409, 425, 429, 500, 502, 503, 504) and attempt < retries - 1:
                 delay = _retry_delay(e.headers, attempt)
                 sp.note("retry", attempt=attempt + 1, error=last, delay=delay, http=e.code)
