@@ -442,6 +442,7 @@ behavior change.
 - Until a chars-per-token ratio is learned for a provider and script class, inputs up to 20% over the estimated limit are tried anyway (a rejected request is free and teaches the ratio); ratios are no longer learned from prompts under 2000 chars (template overhead skewed them).
 - Fallback headers group same-provider errors (`groq (3 models): input too large: ~8321 tokens`).
 - Modern theme overview scrolls again.
+- fanout `drop_none` (CLI `--drop-none`): scan mode, jobs answering NONE are omitted (measured: 20-file scan returned 317 instead of 2802 chars); small file items can be packed.
 
 ### 1.6.0
 

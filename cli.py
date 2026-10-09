@@ -209,6 +209,8 @@ def cmd_fanout(a):
         args["reduce"] = a.reduce
     if a.no_cache:
         args["no_cache"] = True
+    if a.drop_none:
+        args["drop_none"] = True
     print(server.invoke("fanout", args))
     return 0
 
@@ -452,6 +454,8 @@ def main():
     p.add_argument("--output-dir", dest="output_dir", help="write each job's answer to <dir>/NNN-label.md")
     p.add_argument("--reduce", help="instruction for a final job that merges all outputs")
     p.add_argument("--no-cache", action="store_true", dest="no_cache", help="bypass the result cache")
+    p.add_argument("--drop-none", action="store_true", dest="drop_none",
+                   help="omit jobs that found nothing relevant (scan mode)")
     p.set_defaults(fn=cmd_fanout)
 
     p = sub.add_parser("models", help="provider's live model list")

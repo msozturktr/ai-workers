@@ -20,7 +20,7 @@ Hand off: summaries, translation, classification, extraction, log/test-output sc
 Keep: architecture, code edits, security/data-loss decisions, and verifying worker output (it is an unreviewed draft).
 Files: never Read-and-paste. Pass absolute paths/dirs/globs in `files`; the server reads them and skips secrets. Save command output to a file first.
 One job -> delegate. Many files/items -> fanout (one job per file). Leave max_tokens unset unless you need a long answer (auto-sized to stay on free Groq).
-Results you only need to store or pass on: output_file/output_dir. Many parts -> one answer: fanout reduce."""
+Results you only need to store or pass on: output_file/output_dir. Many parts -> one answer: fanout reduce. Scans (which files mention X?): drop_none."""
 
 ALWAYS = {"anthropic/alwaysLoad": True}
 
@@ -74,6 +74,7 @@ TOOLS = [
                 "max_tokens": {"type": "integer", "description": "Answer budget; default auto-sized per role (leave unset)."},
                 "no_cache": {"type": "boolean", "description": "Skip the 7-day result cache."},
                 "pack": {"type": "boolean", "description": "Pack many tiny items into few requests (auto for >=4 short classifier/extractor/translator items with same task; false disables)."},
+                "drop_none": {"type": "boolean", "description": "Append 'reply NONE if nothing relevant' to the task and omit NONE answers."},
                 "output_dir": {"type": "string", "description": "Write each answer to <dir>/NNN-label.md; returns the file list."},
                 "reduce": {"type": "string", "description": "Merge all outputs into one answer with this instruction."},
                 "reduce_role": {"type": "string", "description": "Default summarizer."},
@@ -285,9 +286,17 @@ _PACK_INSTR = ("Apply the task above to EACH numbered item independently. Reply 
                "JSON value if the task asks for JSON). Include every item number exactly once.")
 
 
-def _pack_eligible(jobs, pack, has_files):
+_NONE_SUFFIX = "\n\nIf the input contains nothing relevant to this task, reply with exactly NONE."
+
+
+def _is_none(text):
+    """True when an answer is just NONE (ignoring case, whitespace, surrounding punctuation/markdown)."""
+    return (text or "").strip().strip("*`.\"' \t\r\n").strip().lower() == "none"
+
+
+def _pack_eligible(jobs, pack, drop_none=False):
     """Packing needs one shared role+task, no per-item model and plain-text inputs."""
-    if pack is False or has_files or not jobs:
+    if pack is False or not jobs:
         return False
     if len({(j["role"], j["task"]) for j in jobs}) != 1 or any(j["model"] for j in jobs):
         return False
@@ -295,7 +304,8 @@ def _pack_eligible(jobs, pack, has_files):
         return False
     if pack is True:
         return True
-    return (len(jobs) >= PACK_MIN_ITEMS and jobs[0]["role"] in PACK_ROLES
+    return (len(jobs) >= PACK_MIN_ITEMS
+            and (jobs[0]["role"] in PACK_ROLES or (drop_none and jobs[0]["role"] == "summarizer"))
             and all(len(j["input"]) <= PACK_ITEM_LIMIT for j in jobs))
 
 
@@ -370,6 +380,7 @@ def t_fanout(a):
     conc = max(1, min(int(a.get("concurrency", 6)), 12))
     max_tok = a.get("max_tokens")
     no_cache = bool(a.get("no_cache"))
+    drop_none = bool(a.get("drop_none"))
     reduce_task = a.get("reduce")
     reduce_role = a.get("reduce_role") or "summarizer"
     out_file = out_dir = None
@@ -422,6 +433,8 @@ def t_fanout(a):
             return "ERROR: role and task are required for each job (either provide shared 'role'/'task' or specify per item)."
         if role not in roles:
             return f"ERROR: role '{role}' does not exist. Available roles: {', '.join(roles)}"
+        if drop_none:
+            task += _NONE_SUFFIX
         jobs.append({"idx": i, "label": it.get("label") or f"#{i+1}", "role": role,
                      "task": task, "input": it.get("input"), "model": it.get("model")})
 
@@ -477,7 +490,7 @@ def t_fanout(a):
     packed_n = packed_m = 0
     done = {}
     with ThreadPoolExecutor(max_workers=conc) as ex:
-        if _pack_eligible(jobs, a.get("pack"), bool(a.get("files"))):
+        if _pack_eligible(jobs, a.get("pack"), drop_none):
             packs = _make_packs(jobs)
             for pack, got in [f.result() for f in [
                     ex.submit(T.bound(run_pack), (n, len(packs), p)) for n, p in enumerate(packs, 1)]]:
@@ -492,6 +505,11 @@ def t_fanout(a):
     results.sort(key=lambda x: x[0]["idx"])
     ok = sum(1 for _, r in results if r.get("ok"))
     good = [(j, r) for j, r in results if r.get("ok") and not r.get("warning")]
+    none_idx = set()
+    if drop_none:
+        none_idx = {j["idx"] for j, r in good if _is_none(r.get("text"))}
+        good = [(j, r) for j, r in good if j["idx"] not in none_idx]
+    dn_note = f", {len(good)} with results ({len(none_idx)} NONE omitted)" if drop_none else ""
 
     written = {}
     if out_dir:
@@ -506,7 +524,8 @@ def t_fanout(a):
 
     def failed_lines():
         return [f"- {j['label']}: {str(r.get('error') or r.get('warning') or r.get('tried'))[:200]}"
-                for j, r in results if j["idx"] not in {g["idx"] for g, _ in good}]
+                for j, r in results
+                if j["idx"] not in {g["idx"] for g, _ in good} | none_idx]
 
     if reduce_task and good:
         joined = "\n\n".join(
@@ -522,7 +541,7 @@ def t_fanout(a):
             _job_result(job, rres)
         if rres.get("ok") and not rres.get("warning"):
             cached = " cached" if rres.get("cached") else ""
-            out = [f"# fanout: {ok}/{len(results)} successful{pack_note} -> reduced "
+            out = [f"# fanout: {ok}/{len(results)} successful{dn_note}{pack_note} -> reduced "
                    f"[{reduce_role} -> {rres['provider']}/{rres['model']}{cached}]"]
             if out_dir:
                 out.append(f"per-job outputs: {len(written)} files in {out_dir}")
@@ -543,15 +562,17 @@ def t_fanout(a):
     else:
         note = ""
 
-    head = f"# fanout: {ok}/{len(results)} successful (concurrency={conc}){pack_note}" + note
+    shown = [(j, r) for j, r in results if j["idx"] not in none_idx]
+    conc_note = f" (concurrency={conc})" if not (drop_none and not good) else ""
+    head = f"# fanout: {ok}/{len(results)} successful{dn_note}{conc_note}{pack_note}" + note
     if not reduce_task and not out_dir:
-        compact = _render_compact(head, results)
+        compact = _render_compact(head, shown)
         if compact:
             return compact + S.format_skipped(skipped)
     out = [head]
     if out_dir:
         out.append(f"output_dir: {out_dir}")
-    for j, r in results:
+    for j, r in shown:
         if r.get("ok"):
             rt = r.get("route")
             # a busy same-provider sibling taking over is load balancing, not a fallback
