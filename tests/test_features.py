@@ -106,7 +106,7 @@ class OutputFileTest(unittest.TestCase):
         self.assertIn(f"saved 24 chars, 5 lines -> {path}", out)
         self.assertIn("line1\nline2\nline3", out)
         self.assertNotIn("line4", out)
-        self.assertTrue(out.startswith("[summarizer -> groq/openai/gpt-oss-120b]"))
+        self.assertTrue(out.startswith("[summarizer -> groq/gpt-oss-120b]"))
 
     def test_truncation_note_returned_not_written(self):
         self.run.return_value = _res("abc", truncated=True)
@@ -137,7 +137,7 @@ class OutputFileTest(unittest.TestCase):
 
     def test_cached_marker_in_head(self):
         self.run.return_value = _res(cached=True)
-        self.assertIn("openai/gpt-oss-120b cached]", self.call())
+        self.assertIn("groq/gpt-oss-120b cached]", self.call())
 
 
 class FanoutTest(unittest.TestCase):
@@ -159,7 +159,7 @@ class FanoutTest(unittest.TestCase):
         out_dir = os.path.join(self.d, "o")
         out = self.fanout(items=[{"input": "a", "label": "Foo Bar.txt"}, "b"], output_dir=out_dir)
         self.assertEqual(sorted(os.listdir(out_dir)), ["001-foo-bar-txt.md", "002-2.md"])
-        self.assertIn(f"- Foo Bar.txt [groq/openai/gpt-oss-120b] -> 001-foo-bar-txt.md (5 chars)", out)
+        self.assertIn(f"- Foo Bar.txt -> 001-foo-bar-txt.md (5 chars)", out)
         self.assertNotIn("out:a", out)
 
     def test_output_dir_nonempty_refused(self):

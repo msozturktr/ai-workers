@@ -230,13 +230,12 @@ def t_delegate(a):
             job.note("cache", provider=res.get("provider"), model=res.get("model"))
         _job_result(job, res)
     if not res.get("ok"):
-        return ("WORKER FAILED\n" + json.dumps(res, ensure_ascii=False, indent=2)
-                + S.format_skipped(skipped))
+        return _failed_text("WORKER FAILED", res) + S.format_skipped(skipped)
     if res.get("warning"):
         return f"WARNING: {res['warning']}"
-    head = f"[{role} -> {res['provider']}/{res['model']}{' cached' if res.get('cached') else ''}"
+    head = f"[{role} -> {res['provider']}/{_short(res['model'])}{' cached' if res.get('cached') else ''}"
     if nfiles:
-        head += f", {nfiles} files {len(prompt) // 1000}K chars."
+        head += f", {nfiles} files {len(prompt) // 1000}K chars"
     head += "]"
     shown = [x for x in res.get("route") or [] if x.get("error") != "busy"]
     if shown:
@@ -252,7 +251,7 @@ def t_delegate(a):
 
 
 _INVALID_NOTE = "\n\n[WARNING: output is not valid JSON]"
-_TRUNC_NOTE = "\n\n[WARNING: response TRUNCATED at max_tokens limit - incomplete; increase max_tokens and try again]"
+_TRUNC_NOTE = "\n\n[TRUNCATED at max_tokens \u2014 incomplete; raise max_tokens]"
 
 
 def _job_result(job, res):
@@ -261,9 +260,14 @@ def _job_result(job, res):
             fallback=bool(res.get("route")) or None)
 
 
-def _fb_summary(fb):
-    if isinstance(fb, str):
-        return fb
+def _short(model):
+    """Display name of a model id: no vendor prefix, no ':free' suffix."""
+    m = str(model or "")
+    m = m.rsplit("/", 1)[-1]
+    return m[:-5] if m.endswith(":free") else m
+
+
+def _fb_entries(fb):
     out = []  # same provider + same error kind -> one entry (keeps headers short)
     for x in fb:
         err = str(x.get("error"))
@@ -274,9 +278,22 @@ def _fb_summary(fb):
             out[-1][1].append(x.get("model"))
             continue
         out.append([x["provider"], [x.get("model")], err])
-    return ", ".join(
-        f"{p}/{ms[0]}: {e}" if len(ms) == 1 and ms[0] else f"{p} ({len(ms)} models): {e}"
-        for p, ms, e in out)
+    return [f"{p}/{_short(ms[0])}: {e}" if len(ms) == 1 and ms[0] else f"{p} ({len(ms)} models): {e}"
+            for p, ms, e in out]
+
+
+def _fb_summary(fb):
+    if isinstance(fb, str):
+        return fb
+    return ", ".join(_fb_entries(fb))
+
+
+def _failed_text(prefix, res):
+    """Compact failure text: the error plus one line per (grouped) route entry, <= ~600 chars."""
+    lines = [f"{prefix}: {res.get('error')}"]
+    route = res.get("route") or res.get("tried") or []
+    lines += [f"- {e}" for e in _fb_entries(route)]
+    return "\n".join(lines)[:600]
 
 
 PACK_ROLES = ("classifier", "extractor", "translator")
@@ -341,14 +358,26 @@ def _parse_pack(text):
             for k, v in d.items()}
 
 
-def _tag(r):
+def _dominant(results):
+    """Most common (role, provider, model) among successful results, or None."""
+    from collections import Counter
+    c = Counter((j["role"], r["provider"], r["model"]) for j, r in results if r.get("ok"))
+    return c.most_common(1)[0][0] if c else None
+
+
+def _item_tag(j, r, dom):
+    """'' for the dominant role+model with no flags, else '[role: shortmodel cached fb<-provider]'."""
     rt = r.get("route")
-    fb = (f" fallback<-{rt[0]['provider']}/{rt[0].get('model')}"
-          if rt and rt[0]["provider"] != r["provider"] else "")
-    return f"{r['provider']}/{r['model']}{' cached' if r.get('cached') else ''}{fb}"
+    # a busy same-provider sibling taking over is load balancing, not a fallback
+    fb = f" fb<-{rt[0]['provider']}" if rt and rt[0]["provider"] != r["provider"] else ""
+    cached = " cached" if r.get("cached") else ""
+    if dom == (j["role"], r["provider"], r["model"]) and not cached and not fb:
+        return ""
+    role = f"{j['role']}: " if dom is None or j["role"] != dom[0] else ""
+    return f"[{role}{_short(r['model'])}{cached}{fb}]"
 
 
-def _render_compact(head, results):
+def _render_compact(head, results, dom):
     """One line per item when every successful answer is a short single line; else None."""
     goods = [(j, r) for j, r in results if r.get("ok")]
     if not goods:
@@ -357,15 +386,11 @@ def _render_compact(head, results):
         t = r.get("text") or ""
         if r.get("truncated") or r.get("warning") or r.get("warning_note") or not t.strip() or "\n" in t.strip() or len(t.strip()) > 200:
             return None
-    from collections import Counter
-    dom = Counter((j["role"], f"{r['provider']}/{r['model']}") for j, r in goods).most_common(1)[0][0]
-    lines = [f"{head} [{dom[0]} -> {dom[1]}]"]
+    lines = [head]
     for j, r in results:
         if r.get("ok"):
-            suffix = ""
-            if _tag(r) != dom[1] or j["role"] != dom[0]:
-                suffix = f" [{j['role']} -> {_tag(r)}]" if j["role"] != dom[0] else f" [{_tag(r)}]"
-            lines.append(f"- {j['label']}: {r['text'].strip()}{suffix}")
+            tag = _item_tag(j, r, dom)
+            lines.append(f"- {j['label']}: {r['text'].strip()}" + (f" {tag}" if tag else ""))
         else:
             lines.append(f"- {j['label']}: FAILED: {str(r.get('error') or r.get('tried'))[:200]}")
     return "\n".join(lines)
@@ -542,7 +567,7 @@ def t_fanout(a):
         if rres.get("ok") and not rres.get("warning"):
             cached = " cached" if rres.get("cached") else ""
             out = [f"# fanout: {ok}/{len(results)} successful{dn_note}{pack_note} -> reduced "
-                   f"[{reduce_role} -> {rres['provider']}/{rres['model']}{cached}]"]
+                   f"[{reduce_role} -> {rres['provider']}/{_short(rres['model'])}{cached}]"]
             if out_dir:
                 out.append(f"per-job outputs: {len(written)} files in {out_dir}")
             trunc = _TRUNC_NOTE if rres.get("truncated") else ""
@@ -564,9 +589,11 @@ def t_fanout(a):
 
     shown = [(j, r) for j, r in results if j["idx"] not in none_idx]
     conc_note = f" (concurrency={conc})" if not (drop_none and not good) else ""
-    head = f"# fanout: {ok}/{len(results)} successful{dn_note}{conc_note}{pack_note}" + note
+    dom = _dominant(shown)
+    dom_note = f" \u00b7 {dom[0]} -> {dom[1]}/{_short(dom[2])}" if dom else ""
+    head = f"# fanout: {ok}/{len(results)} successful{dn_note}{conc_note}{pack_note}{dom_note}" + note
     if not reduce_task and not out_dir:
-        compact = _render_compact(head, shown)
+        compact = _render_compact(head, shown, dom)
         if compact:
             return compact + S.format_skipped(skipped)
     out = [head]
@@ -574,22 +601,17 @@ def t_fanout(a):
         out.append(f"output_dir: {out_dir}")
     for j, r in shown:
         if r.get("ok"):
-            rt = r.get("route")
-            # a busy same-provider sibling taking over is load balancing, not a fallback
-            fb = (f" fallback<-{rt[0]['provider']}/{rt[0].get('model')}"
-                  if rt and rt[0]["provider"] != r["provider"] else "")
-            cached = " cached" if r.get("cached") else ""
-            tag = f"{r['provider']}/{r['model']}{cached}{fb}"
+            tag = _item_tag(j, r, dom)
             if j["idx"] in written:
                 path, n = written[j["idx"]]
-                out.append(f"- {j['label']} [{tag}] -> {os.path.basename(path)} ({n} chars)"
+                out.append(f"- {j['label']}{' ' + tag if tag else ''} -> {os.path.basename(path)} ({n} chars)"
                            + (" TRUNCATED" if r.get("truncated") else ""))
                 continue
             body = (r["text"] or "(empty response)") + (_TRUNC_NOTE if r.get("truncated") else "") \
                 + (_INVALID_NOTE if r.get("warning_note") else "")
             if r.get("warning"):
                 body = f"WARNING: {r['warning']}"
-            out.append(f"\n## {j['label']} [{j['role']} -> {tag}]\n{body}")
+            out.append(f"\n## {j['label']}{' ' + tag if tag else ''}\n{body}")
         else:
             out.append(f"\n## {j['label']} [FAILED]\n{r.get('error') or r.get('tried')}")
     return "\n".join(out) + S.format_skipped(skipped)
@@ -601,10 +623,10 @@ def t_ask(a):
                      max_tokens=a.get("max_tokens", 4096), temperature=a.get("temperature", 0.2))
         _job_result(job, res)
     if not res["ok"]:
-        return "FAILED\n" + json.dumps(res, ensure_ascii=False, indent=2)
+        return f"FAILED: {a['provider']}/{a.get('model') or '?'}: {str(res.get('error'))[:300]}"
     warn = f"\nWARNING: {res['warning']}" if res.get("warning") else ""
     trunc = _TRUNC_NOTE if res.get("truncated") else ""
-    return f"[{res['provider']}/{res['model']} tokens={res['tokens']}]{warn}\n\n{res['text']}{trunc}"
+    return f"[{res['provider']}/{_short(res['model'])} tokens={res['tokens']}]{warn}\n\n{res['text']}{trunc}"
 
 
 def t_models(a):

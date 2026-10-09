@@ -58,7 +58,7 @@ class PackTest(unittest.TestCase):
         lines = [l for l in out.splitlines() if l.startswith("- ")]
         self.assertEqual(lines[0], "- #1: A-x0")
         self.assertEqual(lines[29], "- #30: A-x29")
-        self.assertIn("[classifier -> groq/openai/gpt-oss-20b]", out.splitlines()[0])
+        self.assertIn(" · classifier -> groq/gpt-oss-20b", out.splitlines()[0])
 
     def test_not_triggered(self):
         self.patch()
@@ -128,16 +128,16 @@ class PackTest(unittest.TestCase):
         lines = out.splitlines()
         self.assertTrue(lines[0].startswith("# fanout: 3/4 successful"))
         self.assertEqual(lines[1], "- #1: S")
-        self.assertEqual(lines[3], "- #3: S [groq/other]")
+        self.assertEqual(lines[3], "- #3: S [other]")
         self.assertEqual(lines[4], "- #4: FAILED: boom")
 
     def test_long_or_multiline_keeps_old_format(self):
         with mock.patch.object(P, "run", return_value=_res("line1\nline2")):
             out = self.fanout(items=["a"], pack=False)
-        self.assertIn("## #1 [classifier -> groq/openai/gpt-oss-20b]\nline1\nline2", out)
+        self.assertIn("## #1\nline1\nline2", out)
         with mock.patch.object(P, "run", return_value=_res("x" * 201)):
             out = self.fanout(items=["a"], pack=False)
-        self.assertIn("## #1 [classifier -> ", out)
+        self.assertIn("## #1\n", out)
 
 
 if __name__ == "__main__":
