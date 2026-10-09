@@ -1,9 +1,10 @@
 """Single code path for free API providers (all OpenAI-compatible chat endpoints)."""
-import json, os, threading, time, urllib.request, urllib.error
+import http.client, io, json, os, re, socket, threading, time, urllib.parse, urllib.request, urllib.error
 
 import activity as T
+import cache as C
 
-UA = "ai-workers/1.5 (+https://github.com/msozturktr/ai-workers) python-urllib"
+UA = "ai-workers/1.6 (+https://github.com/msozturktr/ai-workers) python-urllib"
 
 CONFIG_DIR = os.path.expanduser("~/.config/ai-workers")
 ENV_FILE = os.path.join(CONFIG_DIR, "env")
@@ -42,11 +43,15 @@ PROVIDERS = {
         "key_env": ["GROQ_API_KEY"],
         "default_model": "openai/gpt-oss-120b",
         "light_model": "openai/gpt-oss-20b",
-        # free tier 8K tokens/min per model; Groq counts max_tokens up front, so the real
-        # input budget is derived per call by input_budget(); this is only the hard cap.
+        # free tier 8K tokens/min per model (continuously refilling bucket); max_tokens is not
+        # charged up front, only the real prompt+completion. Input is limited per request by
+        # min(tpm, itpm), see input_budget().
         "tpm": 8000,
+        "itpm": {"qwen/qwen3.8-27b": 7000},  # separate input-tokens-per-minute limits
+        # every model has its own bucket -> siblings absorb load before Gemini (paid) is used
+        "pool": ["openai/gpt-oss-120b", "qwen/qwen3.8-27b", "openai/gpt-oss-20b"],
         "reasoning": True,  # gpt-oss models accept reasoning_effort
-        "max_input_chars": 24_000,
+        "max_input_chars": 32_000,
     },
     "openrouter": {
         "url": "https://openrouter.ai/api/v1/chat/completions",
@@ -63,19 +68,25 @@ DEFAULT_ROLES = {
     # Turkish and the prompt's format even when the task was in English (measured). Format is default,
     # if the task requests something else, the task wins.
     "researcher":  {"provider": "gemini", "model": "gemini-3.6-flash", "whole_files": True,
+                    "max_tokens": 4096,
                     "system": "You are a research analyst. Read the given source carefully and answer only from facts stated in it. Write 'unclear' where you are not sure. Default format: short bullets with numbered citations."},
     "summarizer":  {"provider": "groq", "model": "openai/gpt-oss-120b", "whole_files": True,
+                    "max_tokens": 2048, "min_tokens": 512, "reasoning_effort": "low",
                     "system": "Summarize the text faithfully. Do not add new information or opinions. Default format: at most 8 bullets."},
     "coder":       {"provider": "groq", "model": "openai/gpt-oss-120b",
+                    "max_tokens": 4096, "min_tokens": 1536,
                     "system": "You are a software engineer. Produce only working code; no explanations unless asked. Follow the existing language and style conventions."},
     "reviewer":    {"provider": "openrouter", "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
-                    "whole_files": True,
+                    "whole_files": True, "max_tokens": 4096,
                     "system": "You are a code/text reviewer. List only concrete, verifiable defects. For each: where, why it is wrong, how it is triggered. If there are none, say there are no findings."},
     "translator":  {"provider": "groq", "model": "openai/gpt-oss-120b", "reasoning_effort": "low",
+                    "max_tokens": 4096, "min_tokens": 512, "out_ratio": 1.3,
                     "system": "Translate the given text into the requested language. Translate every word of natural language; keep code, identifiers, file paths, URLs and formatting unchanged. No explanations; return only the translation."},
     "classifier":  {"provider": "groq", "model": "openai/gpt-oss-20b", "reasoning_effort": "low",
+                    "max_tokens": 512, "min_tokens": 256,
                     "system": "You are a classifier. Return only the requested label and nothing else."},
     "extractor":   {"provider": "groq", "model": "openai/gpt-oss-120b", "reasoning_effort": "low",
+                    "max_tokens": 2048, "min_tokens": 512,
                     "system": "Extract the requested fields from the text and return them as valid JSON. Use null for missing fields. Output nothing but JSON."},
 }
 
@@ -111,9 +122,191 @@ def load_roles():
     return roles
 
 
-# Conservative chars-per-token estimate for mixed code/prose (real ratio is ~3.5-4;
-# a low value overestimates tokens, which is the safe side for rate limits).
+# Chars-per-token is learned per (provider, model) from real usage; the default is
+# conservative for mixed code/prose (real ratio is ~3.5-4; a low value overestimates tokens,
+# which is the safe side for rate limits). Estimates add a 5% safety margin.
 CHARS_PER_TOKEN = 3.2
+CHARS_PER_TOKEN_INTL = 2.6   # non-ASCII-heavy text (e.g. Turkish) tokenizes much worse
+CPT_MIN, CPT_MAX, CPT_ALPHA, CPT_MARGIN = 2.0, 5.0, 0.3, 1.05
+
+STATE_FILE = os.path.join(CONFIG_DIR, "state.json")
+_state_lock = threading.RLock()
+_state_loaded = False
+_cpt = {}        # (provider, model, cls) -> learned chars per token; cls = "ascii" | "intl"
+_cooldown = {}   # (provider, model) -> (until_ts, reason)
+_itpm = {}       # (provider, model) -> learned input-tokens-per-minute limit
+
+
+def _load_state():
+    """Lazily load cooldowns and learned ratios from STATE_FILE (expired entries dropped)."""
+    global _state_loaded
+    with _state_lock:
+        if _state_loaded:
+            return
+        _state_loaded = True
+        try:
+            with open(STATE_FILE) as f:
+                st = json.load(f)
+            now = time.time()
+            for k, v in (st.get("cooldown") or {}).items():
+                p, _, m = k.partition("|")
+                if float(v[0]) > now:
+                    _cooldown.setdefault((p, m), (float(v[0]), str(v[1])))
+            for k, v in (st.get("cpt") or {}).items():
+                parts = k.split("|")
+                if len(parts) != 3 or parts[2] not in ("ascii", "intl"):
+                    continue  # old 2-part keys are ignored
+                _cpt.setdefault(tuple(parts), min(CPT_MAX, max(CPT_MIN, float(v))))
+            for k, v in (st.get("itpm") or {}).items():
+                p, _, m = k.partition("|")
+                if int(v) > 0:
+                    _itpm.setdefault((p, m), int(v))
+        except Exception:
+            pass
+
+
+def _save_state():
+    try:
+        with _state_lock:
+            now = time.time()
+            st = {"cooldown": {f"{p}|{m}": [u, r] for (p, m), (u, r) in _cooldown.items()
+                               if u > now},
+                  "cpt": {f"{p}|{m}|{c}": v for (p, m, c), v in _cpt.items()},
+                  "itpm": {f"{p}|{m}": v for (p, m), v in _itpm.items()}}
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            tmp = f"{STATE_FILE}.{os.getpid()}.{threading.get_ident()}.tmp"
+            with open(tmp, "w") as f:
+                json.dump(st, f)
+            os.replace(tmp, STATE_FILE)
+    except Exception:
+        pass
+
+
+def script_class(text):
+    """"ascii" when at most 2% of the characters are non-ASCII, else "intl"."""
+    if not text:
+        return "ascii"
+    return "ascii" if sum(1 for c in text if ord(c) > 127) <= 0.02 * len(text) else "intl"
+
+
+def _default_cpt(cls):
+    return CHARS_PER_TOKEN_INTL if cls == "intl" else CHARS_PER_TOKEN
+
+
+def chars_per_token(provider, model=None, cls="ascii"):
+    """Learned chars/token for (provider, model, cls), else the provider's average for that
+    class, else the class default."""
+    _load_state()
+    with _state_lock:
+        v = _cpt.get((provider, model, cls))
+        if v:
+            return v
+        vals = [x for (p, _m, c), x in _cpt.items() if p == provider and c == cls]
+    return sum(vals) / len(vals) if vals else _default_cpt(cls)
+
+
+def est_tokens(provider, model, chars, cls="ascii"):
+    return chars / chars_per_token(provider, model, cls) * CPT_MARGIN
+
+
+def _learn_cpt(provider, model, chars, in_tokens, cls="ascii"):
+    try:
+        obs = chars / float(in_tokens)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return
+    if obs <= 0:
+        return
+    obs = min(CPT_MAX, max(CPT_MIN, obs))
+    with _state_lock:
+        _load_state()
+        old = _cpt.get((provider, model, cls)) or chars_per_token(provider, model, cls)
+        _cpt[(provider, model, cls)] = min(CPT_MAX, max(CPT_MIN, (1 - CPT_ALPHA) * old + CPT_ALPHA * obs))
+    _save_state()
+
+
+def _set_cooldown(provider, model, until, reason):
+    _load_state()
+    with _state_lock:
+        _cooldown[(provider, model)] = (until, reason)
+    _save_state()
+
+
+def _cooling(provider, model):
+    """'cooling down until HH:MM: reason' while (provider, model) is in cooldown, else None."""
+    _load_state()
+    with _state_lock:
+        c = _cooldown.get((provider, model))
+        if c and c[0] <= time.time():
+            del _cooldown[(provider, model)]
+            c = None
+    if not c:
+        return None
+    return f"cooling down until {time.strftime('%H:%M', time.localtime(c[0]))}: {c[1]}"
+
+
+_DAILY_RE = re.compile(r"per day|\bTPD\b|\bRPD\b|free-models-per-day", re.I)
+
+
+def _cooldown_from_error(provider, model, code, detail, headers):
+    """Set a cooldown for errors that will not clear within a retry. Returns True if set."""
+    now = time.time()
+    try:
+        ra = float((headers or {}).get("retry-after"))
+    except (TypeError, ValueError):
+        ra = None
+    if code == 429:
+        if _DAILY_RE.search(detail or ""):
+            if provider == "openrouter" and "free-models-per-day" in (detail or "").lower():
+                until = (int(now) // 86400 + 1) * 86400
+            else:
+                until = now + (ra if ra is not None else 3600)
+            _set_cooldown(provider, model, until, "daily limit")
+            return True
+        if ra is not None and ra > 60:
+            _set_cooldown(provider, model, now + ra, f"retry-after {int(ra)}s")
+            return True
+    elif code == 404 and "model_not_found" in (detail or "").lower():
+        _set_cooldown(provider, model, now + 600, "model not found")
+        return True
+    return False
+
+
+_THINK_RE = re.compile(r"^\s*<think>.*?</think>\s*", re.S)
+
+
+def _learned_413(provider, model, chars, max_tokens, detail, cls="ascii"):
+    m = re.search(r"Requested (\d+)", detail or "")
+    if m:
+        in_tok = int(m.group(1)) - (max_tokens or 0)
+        if in_tok > 0:
+            _learn_cpt(provider, model, chars, in_tok, cls)
+
+
+_ITPM_RE = re.compile(r"input tokens per minute \(ITPM\)\D{0,20}?Limit (\d+)", re.I)
+_TRY_AGAIN_RE = re.compile(r"try again in ((?:\d+(?:\.\d+)?(?:ms|h|m|s))+)", re.I)
+
+
+def _learn_itpm(provider, model, detail):
+    """Remember an input-tokens-per-minute limit named in an error body. True if one was found."""
+    m = _ITPM_RE.search(detail or "")
+    if not m or int(m.group(1)) <= 0:
+        return False
+    _load_state()
+    with _state_lock:
+        _itpm[(provider, model)] = int(m.group(1))
+    _save_state()
+    return True
+
+
+def _parse_try_again(detail):
+    """Seconds from 'Please try again in 2.9325s' (also 1m5.4s, 250ms); None if absent."""
+    m = _TRY_AGAIN_RE.search(detail or "")
+    if not m:
+        return None
+    mult = {"h": 3600.0, "m": 60.0, "s": 1.0, "ms": 0.001}
+    return sum(float(n) * mult[u.lower()]
+               for n, u in re.findall(r"(\d+(?:\.\d+)?)(ms|h|m|s)", m.group(1), re.I))
+
 
 _learned_tpm = {}
 _learned_lock = threading.Lock()
@@ -137,66 +330,154 @@ def tpm_limit(provider, model=None):
     return v or (PROVIDERS.get(provider) or {}).get("tpm")
 
 
-def input_budget(provider, max_tokens, model=None):
-    """Max input characters (prompt + system) a call may use, given max_tokens."""
+def itpm_limit(provider, model=None):
+    """Input-tokens-per-minute limit: learned from errors, else configured, else None."""
+    _load_state()
+    with _state_lock:
+        v = _itpm.get((provider, model))
+    return v or ((PROVIDERS.get(provider) or {}).get("itpm") or {}).get(model)
+
+
+def input_limit(provider, model=None):
+    """Per-request input token ceiling: min(TPM, ITPM) where known, else None."""
+    lims = [x for x in (tpm_limit(provider, model), itpm_limit(provider, model)) if x]
+    return min(lims) if lims else None
+
+
+INPUT_MARGIN_TOKENS = 200
+
+
+def _input_cap_chars(provider, model, cls="ascii"):
+    """Hard per-request input size in characters (no output allowance)."""
     cfg = PROVIDERS.get(provider)
     if not cfg:
         return 0
-    tpm = tpm_limit(provider, model or cfg.get("default_model"))
-    if not tpm:
+    lim = input_limit(provider, model)
+    if not lim:
         return cfg["max_input_chars"]
     return min(cfg["max_input_chars"],
-               max(0, int((tpm - max_tokens - 200) * CHARS_PER_TOKEN)))
+               max(0, int((lim - INPUT_MARGIN_TOKENS) * chars_per_token(provider, model, cls) / CPT_MARGIN)))
 
 
-_tpm_windows = {}
+def input_budget(provider, max_tokens, model=None, cls="ascii"):
+    """Input characters (prompt + system) to plan a call/chunk around: the per-request input
+    limit minus an expected-output allowance of min(max_tokens, 1024) tokens
+    (None = auto-sized: assume 1024)."""
+    cfg = PROVIDERS.get(provider)
+    if not cfg:
+        return 0
+    if max_tokens is None:
+        max_tokens = 1024
+    model = model or cfg.get("default_model")
+    lim = input_limit(provider, model)
+    if not lim:
+        return cfg["max_input_chars"]
+    allow = min(max_tokens, 1024)
+    return min(cfg["max_input_chars"],
+               max(0, int((lim - INPUT_MARGIN_TOKENS - allow) * chars_per_token(provider, model, cls) / CPT_MARGIN)))
+
+
+# Token bucket per (provider, model): capacity = limit, refills limit/60 per second. A request
+# is admitted when level >= need (estimated input + small output allowance); the real usage is
+# synced from response headers (or settled from usage) afterwards. level may go negative after
+# a 429 that told us how long to wait.
+_buckets = {}   # key -> {"level": float, "ts": float, "inflight": [float, ...]}
 _tpm_lock = threading.Lock()
 TPM_MAX_WAIT = 30.0
+OUT_ESTIMATE = 256
 
 
-def _tpm_acquire(key, need, limit, now=time.time, sleep=time.sleep):
-    """Reserve `need` tokens in the 60 s sliding window for `key`; sleeps while the window
-    is full (at most TPM_MAX_WAIT in total, then proceeds anyway). Returns seconds waited."""
-    cap = 0.95 * limit
+def _bucket(key, limit, t):
+    """Refilled bucket for key; caller holds _tpm_lock."""
+    b = _buckets.get(key)
+    if b is None:
+        b = _buckets[key] = {"level": float(limit), "ts": t, "inflight": []}
+    elif t > b["ts"]:
+        b["level"] = min(float(limit), b["level"] + (t - b["ts"]) * limit / 60.0)
+        b["ts"] = t
+    return b
+
+
+def _tpm_acquire(key, need, limit, now=None, sleep=None, block=True):
+    """Reserve `need` tokens. Returns ("ok", seconds_waited), ("busy", None) when block=False
+    and the bucket cannot cover it now, or ("long", wait_seconds) when covering it would take
+    longer than TPM_MAX_WAIT in total (nothing reserved in either failure case)."""
+    now = now or time.time
+    sleep = sleep or time.sleep
+    need = min(float(need), float(limit))
+    rate = limit / 60.0
     waited = 0.0
     while True:
         with _tpm_lock:
-            t = now()
-            win = _tpm_windows.setdefault(key, [])
-            win[:] = [e for e in win if e[0] > t - 60]
-            total = sum(e[1] for e in win)
-            wait = 0.0
-            if total + need > cap and waited < TPM_MAX_WAIT:
-                for ts, tok in win:  # oldest first
-                    total -= tok
-                    wait = ts + 60 - t
-                    if total + need <= cap:
-                        break
-                wait = min(max(wait, 0.0) + 0.05, TPM_MAX_WAIT - waited)
-            if wait <= 0:
-                win.append([t, need])
-                return waited
+            b = _bucket(key, limit, now())
+            if b["level"] >= need:
+                b["level"] -= need
+                b["inflight"].append(need)
+                return "ok", waited
+            wait = (need - b["level"]) / rate + 0.05
+            if not block:
+                return "busy", None
+            if waited + wait > TPM_MAX_WAIT:
+                return "long", round(waited + wait, 1)
         sleep(wait)
         waited += wait
 
 
-def _tpm_release(key, need):
-    """Drop the newest reservation of `need` tokens (the request was rejected)."""
+def _tpm_room(key, need, limit, now=None):
+    """True if `need` tokens are available right now (no reservation)."""
+    now = now or time.time
     with _tpm_lock:
-        win = _tpm_windows.get(key, [])
-        for i in range(len(win) - 1, -1, -1):
-            if win[i][1] == need:
-                del win[i]
-                return
+        return _bucket(key, limit, now())["level"] >= min(float(need), float(limit))
 
 
-def _tpm_settle(key, need, actual):
-    """Replace the newest reservation of `need` tokens with the actual usage."""
+def _drop_inflight(b, need):
+    for i in range(len(b["inflight"]) - 1, -1, -1):
+        if abs(b["inflight"][i] - need) < 1e-9:
+            del b["inflight"][i]
+            return
+
+
+def _tpm_release(key, need, limit, now=None):
+    """Give back an unused reservation (the request never ran)."""
+    now = now or time.time
+    need = min(float(need), float(limit))
     with _tpm_lock:
-        for e in reversed(_tpm_windows.get(key, [])):
-            if e[1] == need:
-                e[1] = actual
-                return
+        b = _bucket(key, limit, now())
+        _drop_inflight(b, need)
+        b["level"] = min(float(limit), b["level"] + need)
+
+
+def _tpm_settle(key, need, actual, limit, now=None):
+    """No header available: replace the reservation by the actual prompt+completion tokens."""
+    now = now or time.time
+    need = min(float(need), float(limit))
+    with _tpm_lock:
+        b = _bucket(key, limit, now())
+        _drop_inflight(b, need)
+        b["level"] = min(float(limit), b["level"] + need - actual)
+
+
+def _tpm_sync(key, need, remaining, limit, now=None):
+    """Provider reported `remaining` tokens: trust it, minus other in-flight reservations.
+    Also covers other processes sharing the key (their usage is inside `remaining`)."""
+    now = now or time.time
+    need = min(float(need), float(limit))
+    with _tpm_lock:
+        b = _bucket(key, limit, now())
+        _drop_inflight(b, need)
+        b["level"] = min(float(limit), float(remaining) - sum(b["inflight"]))
+        b["ts"] = now()
+
+
+def _tpm_penalize(key, need, wait, limit, now=None):
+    """429 told us to wait `wait` s: set the level so `need` becomes available after that long.
+    Drops this call's reservation."""
+    now = now or time.time
+    need = min(float(need), float(limit))
+    with _tpm_lock:
+        b = _bucket(key, limit, now())
+        _drop_inflight(b, need)
+        b["level"] = need - wait * limit / 60.0
 
 
 def api_key(provider):
@@ -211,7 +492,35 @@ def available_providers():
     return [p for p in PROVIDERS if api_key(p)]
 
 
-def _post(url, key, payload, timeout=180):
+_POOL_MAX_IDLE = 8
+_pool = {}  # (scheme, host, port) -> [idle connections]
+_pool_lock = threading.Lock()
+_STALE = (http.client.RemoteDisconnected, BrokenPipeError, ConnectionResetError,
+          http.client.BadStatusLine, http.client.CannotSendRequest,
+          http.client.ResponseNotReady)
+
+
+def _conn_factory(scheme, host, port, timeout):
+    cls = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
+    return cls(host, port, timeout=timeout)
+
+
+def _pool_get(pk):
+    with _pool_lock:
+        idle = _pool.get(pk)
+        return idle.pop() if idle else None
+
+
+def _pool_put(pk, conn):
+    with _pool_lock:
+        idle = _pool.setdefault(pk, [])
+        if len(idle) < _POOL_MAX_IDLE:
+            idle.append(conn)
+            return
+    conn.close()
+
+
+def _post_urllib(url, key, payload, timeout):
     body = json.dumps(payload).encode()
     req = urllib.request.Request(
         url, data=body, method="POST",
@@ -220,6 +529,49 @@ def _post(url, key, payload, timeout=180):
     )
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode()), dict(r.headers)
+
+
+def _post(url, key, payload, timeout=180):
+    """POST JSON over a pooled keep-alive connection -> (json, headers dict)."""
+    if os.environ.get("AI_WORKERS_NO_KEEPALIVE"):
+        return _post_urllib(url, key, payload, timeout)
+    body = json.dumps(payload).encode()
+    u = urllib.parse.urlsplit(url)
+    scheme = u.scheme or "https"
+    port = u.port or (443 if scheme == "https" else 80)
+    pk = (scheme, u.hostname, port)
+    path = (u.path or "/") + (f"?{u.query}" if u.query else "")
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json",
+               "User-Agent": UA, "Accept": "application/json"}
+    for attempt in (0, 1):
+        conn = _pool_get(pk) if attempt == 0 else None
+        reused = conn is not None
+        if conn is None:
+            conn = _conn_factory(scheme, u.hostname, port, timeout)
+        else:
+            conn.timeout = timeout
+            if getattr(conn, "sock", None) is not None:
+                conn.sock.settimeout(timeout)
+        try:
+            conn.request("POST", path, body=body, headers=headers)
+            r = conn.getresponse()
+            data = r.read()
+        except _STALE:
+            conn.close()
+            if reused:
+                continue  # stale idle connection: retry once on a fresh one
+            raise
+        except BaseException:
+            conn.close()
+            raise
+        hdrs = r.msg
+        if r.will_close or (hdrs.get("Connection") or "").lower() == "close":
+            conn.close()
+        else:
+            _pool_put(pk, conn)
+        if r.status >= 400:
+            raise urllib.error.HTTPError(url, r.status, r.reason, hdrs, io.BytesIO(data))
+        return json.loads(data.decode()), dict(hdrs)
 
 
 LEDGER = os.path.join(CONFIG_DIR, "ledger.jsonl")
@@ -265,7 +617,10 @@ def _record_unlocked(provider, model, role, res, headers):
                     snap = json.load(f)
             except (FileNotFoundError, json.JSONDecodeError):
                 snap = {}
-            snap[provider] = {"ts": row["ts"], "model": model, **rl}
+            prev = snap.get(provider)
+            models = dict(prev.get("models") or {}) if isinstance(prev, dict) else {}
+            models[model] = {"ts": row["ts"], **rl}
+            snap[provider] = {"ts": row["ts"], "model": model, **rl, "models": models}
             tmp = f"{RATELIMIT_SNAPSHOT}.{os.getpid()}.{threading.get_ident()}.tmp"
             with open(tmp, "w") as f:
                 json.dump(snap, f, indent=2)
@@ -274,8 +629,26 @@ def _record_unlocked(provider, model, role, res, headers):
         pass  # measurement should never break execution
 
 
-def _retry_delay(headers, attempt):
-    """Respect the provider's Retry-After value (on the order of seconds for Groq TPM limit)."""
+def _record_cached(hit, role):
+    """Ledger row for a cache hit (no quota used; counted only in efficiency stats)."""
+    try:
+        tk = hit.get("tokens") or {}
+        with _record_lock:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            row = {"ts": int(time.time()), "provider": hit.get("provider"),
+                   "model": hit.get("model"), "role": role, "ok": True, "in": 0, "out": 0,
+                   "cached": True, "saved_in": tk.get("in") or 0, "saved_out": tk.get("out") or 0}
+            with open(LEDGER, "a") as f:
+                f.write(json.dumps(row) + "\n")
+    except Exception:
+        pass
+
+
+def _retry_delay(headers, attempt, detail=None):
+    """Respect the provider's wait hint: 'try again in Xs' in the body, else Retry-After."""
+    x = _parse_try_again(detail)
+    if x is not None:
+        return max(0.5, min(x + 0.25, 60))
     try:
         ra = float((headers or {}).get("retry-after"))
         return max(0.5, min(ra + 0.5, 60))
@@ -284,7 +657,8 @@ def _retry_delay(headers, attempt):
 
 
 def chat(provider, prompt, system=None, model=None, max_tokens=4096,
-         temperature=0.2, retries=4, timeout=180, role=None, reasoning_effort=None):
+         temperature=0.2, retries=4, timeout=180, role=None, reasoning_effort=None,
+         retry_429=True):
     """Single worker call. Backs off and retries on rate-limit/5xx conditions.
 
     Never raises an exception: if no key, unknown provider, or input exceeds provider
@@ -297,7 +671,7 @@ def chat(provider, prompt, system=None, model=None, max_tokens=4096,
                 reasoning_effort=reasoning_effort,
                 system=T.blob(system), prompt=T.blob(prompt)) as sp:
         res = _chat(sp, provider, prompt, system, model, max_tokens, temperature,
-                    retries, timeout, role, reasoning_effort)
+                    retries, timeout, role, reasoning_effort, retry_429)
         tok = res.get("tokens")
         sp.set(status="ok" if res.get("ok") else ("skipped" if res.get("skipped") else "error"),
                model=res.get("model") or model or cfg.get("default_model"),
@@ -318,7 +692,7 @@ def _build_payload(provider, model, msgs, max_tokens, temperature, reasoning_eff
 
 
 def _chat(sp, provider, prompt, system, model, max_tokens, temperature, retries, timeout, role,
-          reasoning_effort=None):
+          reasoning_effort=None, retry_429=True):
     if provider not in PROVIDERS:
         return {"ok": False, "skipped": True, "provider": provider, "model": model,
                 "error": f"unknown provider: {provider}"}
@@ -327,8 +701,13 @@ def _chat(sp, provider, prompt, system, model, max_tokens, temperature, retries,
     if not key:
         return {"ok": False, "skipped": True, "provider": provider, "model": model,
                 "error": f"missing key ({ENV_FILE} -> {cfg['key_env'][0]}=...)"}
+    cool = _cooling(provider, model or cfg["default_model"])
+    if cool:
+        return {"ok": False, "skipped": True, "provider": provider,
+                "model": model or cfg["default_model"], "error": cool}
     size = len(prompt) + len(system or "")
-    budget = input_budget(provider, max_tokens, model or cfg["default_model"])
+    cls = script_class((system or "") + prompt)
+    budget = _input_cap_chars(provider, model or cfg["default_model"], cls)
     if size > budget:
         return {"ok": False, "skipped": True, "provider": provider, "model": model,
                 "error": f"input too large: {size} characters > {provider} budget "
@@ -341,13 +720,20 @@ def _chat(sp, provider, prompt, system, model, max_tokens, temperature, retries,
     last = None
     tpm = tpm_limit(provider, payload["model"])
     tkey = (provider, payload["model"])
-    need = size / CHARS_PER_TOKEN + max_tokens
+    est_in = est_tokens(provider, payload["model"], size, cls)
+    need = est_in + min(max_tokens, OUT_ESTIMATE)
     reserved = False
     for attempt in range(retries):
         try:
             if tpm and not reserved:  # one reservation per call (re-acquired after a 429)
+                st, waited = _tpm_acquire(tkey, need, tpm, block=retry_429)
+                if st == "busy":  # sibling candidates exist: do not queue, let the router move on
+                    return {"ok": False, "skipped": True, "provider": provider,
+                            "model": payload["model"], "error": "busy"}
+                if st == "long":  # a guaranteed 429 later: let the router try the next provider
+                    return {"ok": False, "skipped": True, "provider": provider,
+                            "model": payload["model"], "error": f"would wait {waited:.0f}s"}
                 reserved = True
-                waited = _tpm_acquire(tkey, need, tpm)
                 if waited > 0.5:
                     sp.note("throttle", waited=round(waited, 1), need=int(need))
             data, hdrs = _post(cfg["url"], key, payload, timeout)
@@ -367,7 +753,7 @@ def _chat(sp, provider, prompt, system, model, max_tokens, temperature, retries,
                     continue
                 break
             choice = (data.get("choices") or [{}])[0]
-            text = (choice.get("message") or {}).get("content") or ""
+            text = _THINK_RE.sub("", (choice.get("message") or {}).get("content") or "")
             usage = data.get("usage") or {}
             res = {
                 "ok": True, "provider": provider, "model": payload["model"],
@@ -383,21 +769,49 @@ def _chat(sp, provider, prompt, system, model, max_tokens, temperature, retries,
                 "truncated": bool(text.strip()) and choice.get("finish_reason") == "length",
             }
             _learn_tpm(provider, payload["model"], hdrs)
-            if tpm and usage.get("prompt_tokens") is not None:
-                # Groq charges max_tokens up front, so keep it reserved; only the input
-                # estimate is corrected to the real prompt size.
-                _tpm_settle(tkey, need, (usage.get("prompt_tokens") or 0) + max_tokens)
+            if usage.get("prompt_tokens"):
+                _learn_cpt(provider, payload["model"], size, usage["prompt_tokens"], cls)
+            if tpm and reserved:
+                rem = _rl_from_headers(hdrs).get("remaining-tokens")
+                try:
+                    _tpm_sync(tkey, need, float(rem), tpm)
+                except (TypeError, ValueError):
+                    if usage.get("prompt_tokens") is not None:
+                        _tpm_settle(tkey, need, (usage.get("prompt_tokens") or 0)
+                                    + (usage.get("completion_tokens") or 0), tpm)
+                    else:
+                        _tpm_release(tkey, need, tpm)
             _record(provider, payload["model"], role, res, hdrs)
             sp.set(ratelimit=_rl_from_headers(hdrs) or None, tries=attempt + 1)
             return res
         except urllib.error.HTTPError as e:
             detail = e.read().decode()[:600]
             last = f"HTTP {e.code}: {detail}"
+            wait_hint = _parse_try_again(detail) if e.code == 429 else None
             if e.code == 429 and tpm and reserved:
-                _tpm_release(tkey, need)  # rejected requests are not charged; the retry
-                reserved = False          # must wait for room in the window again
+                if wait_hint is None:
+                    try:
+                        wait_hint = float((e.headers or {}).get("retry-after"))
+                    except (TypeError, ValueError):
+                        pass
+                if wait_hint is not None:  # bucket empty until then; retry must wait for room
+                    _tpm_penalize(tkey, need, wait_hint, tpm)
+                else:
+                    _tpm_release(tkey, need, tpm)
+                reserved = False
+            if e.code in (413, 429) and _learn_itpm(provider, payload["model"], detail):
+                lim = input_limit(provider, payload["model"])
+                if lim and est_in > lim - INPUT_MARGIN_TOKENS:
+                    break  # this input can never fit; the router moves on
+            if e.code == 413:
+                _learned_413(provider, payload["model"], size, max_tokens, detail, cls)
+                break
+            if _cooldown_from_error(provider, payload["model"], e.code, detail, e.headers):
+                break  # daily limit / long retry-after / unknown model: retrying is pointless
+            if e.code == 429 and not retry_429:
+                break  # a sibling candidate can take over right now
             if e.code in (408, 409, 425, 429, 500, 502, 503, 504) and attempt < retries - 1:
-                delay = _retry_delay(e.headers, attempt)
+                delay = _retry_delay(e.headers, attempt, detail if e.code == 429 else None)
                 sp.note("retry", attempt=attempt + 1, error=last, delay=delay, http=e.code)
                 time.sleep(delay)
                 continue
@@ -414,6 +828,107 @@ def _chat(sp, provider, prompt, system, model, max_tokens, temperature, retries,
     _record(provider, payload["model"], role, res, None)
     sp.set(tries=attempt + 1)
     return res
+
+
+def _auto_tokens(spec, provider, model, size, max_tokens, cls="ascii"):
+    """(max_tokens, skip_error) for one candidate. Explicit max_tokens passes through."""
+    if max_tokens is not None:
+        return max_tokens, None
+    cap = spec.get("max_tokens", 4096)
+    floor = spec.get("min_tokens", 512)
+    est = est_tokens(provider, model, size, cls)
+    if spec.get("out_ratio"):
+        floor = max(floor, int(est * spec["out_ratio"]))
+    lim = input_limit(provider, model)
+    if lim and est > lim - INPUT_MARGIN_TOKENS:
+        return None, (f"input too large for {provider}/{model}: ~{int(est)} tokens > "
+                      f"{lim - INPUT_MARGIN_TOKENS}")
+    return max(cap, floor), None
+
+
+def run(spec, prompt, max_tokens=None, model=None, no_fallback=False, role=None, no_cache=False):
+    """Cached front of _route(): an identical job within the TTL costs no provider call."""
+    key = None
+    if not no_cache:
+        key = C.make_key(role=role, system=spec.get("system"), provider=spec.get("provider"),
+                         model=spec.get("model"), pool=spec.get("pool"),
+                         reasoning_effort=spec.get("reasoning_effort"), override=model,
+                         max_tokens=max_tokens, prompt=prompt)
+        hit = C.get(key)
+        if hit:
+            hit["cached"] = True
+            hit["route"] = []
+            _record_cached(hit, role)
+            return hit
+    res = _route(spec, prompt, max_tokens, model, no_fallback, role)
+    if key and res.get("ok"):
+        C.put(key, res)
+    return res
+
+
+def _route(spec, prompt, max_tokens=None, model=None, no_fallback=False, role=None):
+    """Route one job: primary model, same-provider siblings (pool), then other providers.
+
+    Returns the chat() result plus "route": candidates tried/skipped before the winner
+    (each {"provider", "model", "error"}). max_tokens=None sizes the answer per candidate."""
+    system = spec.get("system")
+    kw = dict(system=system, role=role, reasoning_effort=spec.get("reasoning_effort"))
+    prov = spec["provider"]
+    pcfg = PROVIDERS.get(prov) or {}
+    prim = model or spec.get("model") or pcfg.get("default_model")
+    same = [(prov, prim)]
+    if not model:
+        pool = spec.get("pool") or pcfg.get("pool") or []
+        same += [(prov, m) for m in pool if m != prim]
+    groups = [same]
+    if not no_fallback:
+        groups += [[(q, PROVIDERS[q]["default_model"])] for q in FALLBACK_ORDER if q != prov]
+
+    size = len(prompt) + len(system or "")
+    cls = script_class((system or "") + prompt)
+    route, best, dead = [], None, set()
+    for group in groups:
+        viable = []
+        for p, m in group:
+            if p in dead:
+                continue
+            err = _cooling(p, m)
+            mt = None
+            if not err:
+                mt, err = _auto_tokens(spec, p, m, size, max_tokens, cls)
+            if err:
+                route.append({"provider": p, "model": m, "error": err})
+            else:
+                viable.append((p, m, mt))
+
+        def has_room(c):
+            lim = tpm_limit(c[0], c[1])
+            return not lim or _tpm_room((c[0], c[1]),
+                                        est_tokens(c[0], c[1], size, cls) + min(c[2], OUT_ESTIMATE), lim)
+        viable.sort(key=lambda c: not has_room(c))  # stable: candidates with room first
+        for i, (p, m, mt) in enumerate(viable):
+            if p in dead:
+                continue
+            res = chat(p, prompt, model=m, max_tokens=mt,
+                       retry_429=(i == len(viable) - 1), **kw)
+            if res.get("ok"):
+                reduced = max_tokens is None and mt < spec.get("max_tokens", 4096)
+                if reduced and (res.get("truncated") or res.get("warning")):
+                    best = best or res
+                    route.append({"provider": p, "model": m,
+                                  "error": f"truncated at auto max_tokens {mt}"})
+                    dead.add(p)  # same-provider siblings share the TPM tier: go to next provider
+                    continue
+                res["route"] = route
+                return res
+            route.append({"provider": p, "model": res.get("model") or m,
+                          "error": res.get("error")})
+            if str(res.get("error")).startswith(("missing key", "unknown provider")):
+                dead.add(p)  # siblings cannot work either
+    if best:
+        best["route"] = route
+        return best
+    return {"ok": False, "error": "all providers failed", "route": route}
 
 
 def chat_with_fallback(providers, prompt, **kw):

@@ -217,10 +217,28 @@ def _model_breakdown(provider, rows_today, now, model_limits, free_limits=None):
     return out
 
 
+def efficiency(rows):
+    """Today's efficiency from ledger rows (cache hits included)."""
+    jobs = len(rows)
+    hits = [r for r in rows if r.get("cached")]
+    real = [r for r in rows if not r.get("cached")]
+    free = sum(1 for r in real if r.get("provider") in ("groq", "openrouter"))
+    gem = sum(1 for r in real if r.get("provider") == "gemini")
+    saved = sum((r.get("saved_in") or 0) + (r.get("saved_out") or 0) for r in hits)
+    return {"jobs": jobs, "free": free, "gemini": gem, "cache_hits": len(hits),
+            "tokens_saved": saved,
+            "free_pct": round(free / jobs * 100) if jobs else 0}
+
+
+def _fmt_tok(n):
+    return f"{n / 1000:.1f}K" if n >= 1000 else str(n)
+
+
 def workers_usage():
     """Worker models usage: live quota + local counter."""
     day0 = _local_day_start()
-    rows_today = _ledger(day0)
+    rows_all = _ledger(day0)
+    rows_today = [r for r in rows_all if not r.get("cached")]  # cache hits use no quota
     now = int(time.time())
     rows_min = [r for r in rows_today if r["ts"] >= now - 60]
     snap = _snapshot()
@@ -253,6 +271,19 @@ def workers_usage():
                         "tokens": {"remaining": rt, "limit": lt,
                                    "reset": s.get("reset-tokens")},
                     }
+                    models = []
+                    for name, ms in sorted((s.get("models") or {}).items()):
+                        try:
+                            lim = int(ms.get("limit-tokens", 0))
+                            age = max(0, now - int(ms.get("ts", now)))
+                            # bucket refills limit/60 per second since the snapshot
+                            rem = min(lim, int(ms.get("remaining-tokens", 0)) + int(age * lim / 60))
+                            models.append({"model": name, "remaining": rem, "limit": lim,
+                                           "age_sec": age})
+                        except (TypeError, ValueError, AttributeError):
+                            pass
+                    if models:
+                        rec["quota"]["tokens"]["models"] = models
                     rec["source"] = "live (response headers)"
                     rec["as_of_age_sec"] = now - int(s.get("ts", now))
                 except (TypeError, ValueError):
@@ -380,7 +411,7 @@ def claude_usage():
 
 def snapshot():
     return {"generated_at": int(time.time()), "workers": workers_usage(),
-            "claude": claude_usage()}
+            "claude": claude_usage(), "efficiency": efficiency(_ledger(_local_day_start()))}
 
 
 def format_report(snap):
@@ -428,13 +459,23 @@ def format_report(snap):
                 bits.append(f"resets: {rq['reset']}")
         if q.get("tokens", {}).get("limit"):
             t = q["tokens"]
-            bits.append(f"token window {t['remaining']}/{t['limit']}")
+            if t.get("models"):
+                bits.append("token window: " + ", ".join(
+                    f"{m['model'].rsplit('/', 1)[-1]} {m['remaining']}/{m['limit']}"
+                    for m in t["models"]))
+            else:
+                bits.append(f"token window {t['remaining']}/{t['limit']}")
         if w.get("today_failed"):
             bits.append(f"{w['today_failed']} FAILED")
         out.append(f"- {w['provider']}: " + " | ".join(bits))
         out.append(f"  source: {w['source']}")
         if w.get("note"):
             out.append(f"  note: {w['note']}")
+    e = snap.get("efficiency")
+    if e:
+        out += ["", "## Efficiency (today)",
+                f"- {e['jobs']} jobs: {e['free']} free ({e['free_pct']}%), {e['gemini']} gemini, "
+                f"{e['cache_hits']} cache hits ({_fmt_tok(e['tokens_saved'])} tokens saved)"]
     c = snap["claude"]
     live = c.get("live") or {}
     out += ["", "## Claude (live subscription limits)"]

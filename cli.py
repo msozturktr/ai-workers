@@ -181,6 +181,10 @@ def cmd_run(a):
         args["input"] = data
     if a.model:
         args["model"] = a.model
+    if a.output:
+        args["output_file"] = os.path.abspath(os.path.expanduser(a.output))
+    if a.no_cache:
+        args["no_cache"] = True
     if a.files:
         args["files"] = _abs(a.files)
     print(server.invoke("delegate", args))
@@ -199,6 +203,12 @@ def cmd_fanout(a):
             "concurrency": a.concurrency, "max_tokens": a.max_tokens}
     if a.files:
         args["files"] = _abs(a.files)
+    if a.output_dir:
+        args["output_dir"] = os.path.abspath(os.path.expanduser(a.output_dir))
+    if a.reduce:
+        args["reduce"] = a.reduce
+    if a.no_cache:
+        args["no_cache"] = True
     print(server.invoke("fanout", args))
     return 0
 
@@ -326,16 +336,21 @@ def main():
 
     p = sub.add_parser("run", help="delegate a single task to a role")
     p.add_argument("role"); p.add_argument("task")
-    p.add_argument("--model"); p.add_argument("--max-tokens", type=int, default=4096,
+    p.add_argument("--model"); p.add_argument("--max-tokens", type=int, default=None,
                                               dest="max_tokens")
     p.add_argument("-f", "--files", nargs="+", help="file/directory/glob (read by server)")
+    p.add_argument("-o", "--output", help="write the answer to this file (prints path + preview)")
+    p.add_argument("--no-cache", action="store_true", dest="no_cache", help="bypass the result cache")
     p.set_defaults(fn=cmd_run)
 
     p = sub.add_parser("fanout", help="distribute each line in stdin as a parallel task")
     p.add_argument("role"); p.add_argument("task")
-    p.add_argument("-c", "--concurrency", type=int, default=4)
-    p.add_argument("--max-tokens", type=int, default=4096, dest="max_tokens")
+    p.add_argument("-c", "--concurrency", type=int, default=6)
+    p.add_argument("--max-tokens", type=int, default=None, dest="max_tokens")
     p.add_argument("-f", "--files", nargs="+", help="each file is a separate task (split if large)")
+    p.add_argument("--output-dir", dest="output_dir", help="write each job's answer to <dir>/NNN-label.md")
+    p.add_argument("--reduce", help="instruction for a final job that merges all outputs")
+    p.add_argument("--no-cache", action="store_true", dest="no_cache", help="bypass the result cache")
     p.set_defaults(fn=cmd_fanout)
 
     p = sub.add_parser("models", help="provider's live model list")

@@ -15,8 +15,11 @@ returns only the worker's answer, so file contents never enter Claude's context.
 run this cut Claude-side tokens by **~85%** ([details](#measured-token-savings)).
 
 - **No dependencies.** Server, CLI and dashboard use the Python standard library only.
-- **Resilient.** Automatic fallback across providers, retries that honour `Retry-After`,
-  per-job failure isolation in parallel runs.
+- **Resilient.** Same-provider model pool, then fallback across providers, a token-bucket
+  limiter, cooldowns for exhausted models, retries that honour `Retry-After`, per-job failure
+  isolation in parallel runs.
+- **Frugal.** A 7-day result cache (identical job: no provider call), request packing for
+  short items and keep-alive connections.
 - **Safe by default.** Secret files (`.env`, keys, `~/.ssh`, ...) are never sent to a provider.
 - **Observable.** A desktop app with a live activity log (who sent what to which model, every
   retry and fallback, the exact prompts and responses) and the remaining quota of every
@@ -37,6 +40,7 @@ run this cut Claude-side tokens by **~85%** ([details](#measured-token-savings))
 - [Resilience and provider notes](#resilience-and-provider-notes)
 - [Project layout](#project-layout)
 - [Development](#development)
+- [Changelog](#changelog)
 
 ## Quick start
 
@@ -95,6 +99,19 @@ blocks `ping` or other calls.
 | classifier | groq       | openai/gpt-oss-20b                     | tagging, triage (fastest)     |
 | extractor  | groq       | openai/gpt-oss-120b                    | structured JSON extraction    |
 
+**Routing.** `providers.run` tries the role's model first, then the other models of the same
+provider (Groq pool: `openai/gpt-oss-120b`, `qwen/qwen3.8-27b`, `openai/gpt-oss-20b`), then the
+other providers in the order Groq → Gemini → OpenRouter. Each Groq model has its own 8K
+tokens/minute bucket, so siblings are used before paid Gemini; a busy sibling is skipped without
+waiting. An explicit `model` argument disables the siblings; `no_fallback` keeps them but skips
+other providers.
+
+**Answer length.** `max_tokens` is sized automatically per role and call. A role can set
+`max_tokens` (cap), `min_tokens` and `out_ratio` (answer at least `out_ratio` x the input
+estimate, e.g. translation). An explicit `max_tokens` overrides this. Measured 2026-10-10: Groq
+no longer charges `max_tokens` up front, only the tokens actually used, so a larger value costs
+no quota.
+
 Bulk work runs on Groq (free, 1,000 requests/day). Gemini (Tier 1, paid) serves the researcher
 role and any input too large for Groq. Roles can be changed or added in
 [`config.json`](#configuration).
@@ -115,6 +132,19 @@ fanout(role="classifier", task="...", files=["~/code/myapp/src/**/*.py"])
 ```
 
 - `delegate` merges all files into one input. `fanout` makes one job per file (max 200 jobs).
+- **Output to disk.** `delegate` takes `output_file`, `fanout` takes `output_dir` (one
+  `NNN-label.md` per job) or, with `reduce`, `output_file`. Results are written there and only
+  the path and a preview are returned, so long outputs stay out of Claude's context. Secret
+  paths are refused, and so are existing files unless `overwrite: true`.
+- **Map-reduce.** `fanout` with `reduce` (an instruction) runs a final job over all outputs and
+  returns one merged answer; `reduce_role` picks its role (default `summarizer`).
+- **Packing.** For `classifier`, `extractor` and `translator`, four or more short items with the
+  same task are packed up to 20 per request. The model answers with a JSON array that is mapped
+  back to the items; unparsed or missing items are re-run individually. Measured: 30 sentiment
+  items took 2 requests and 30/30 were correct. Short answers are rendered one line per item.
+- **Result cache.** An identical job (role, model, task, input) is answered from
+  `~/.config/ai-workers/cache` for 7 days without calling a provider. `no_cache: true` skips it.
+  Cache hits appear in the ledger and in the usage report's Efficiency section.
 - **Whole files for understanding.** `summarizer`, `researcher` and `reviewer` never split a
   file; one that exceeds Groq's budget goes to Gemini in one piece. Chunks lose context and made
   summaries invent things.
@@ -124,11 +154,14 @@ fanout(role="classifier", task="...", files=["~/code/myapp/src/**/*.py"])
 - **Never sent:** secret files (`.env*`, `*.pem`, `*.key`, `id_rsa*`, `credentials*`,
   `*secret*`, `~/.ssh`, `~/.config/ai-workers`, ...), binary files, files over 8 MB. Directory
   and glob scans skip `.git`, `node_modules`, `__pycache__`, `.venv`, `obj`, `bin`, `.next`, ...
-- **Input budgets.** Groq's free tier allows ~8K tokens per minute and counts `max_tokens` up
-  front, so its input budget is computed per call: `(8000 − max_tokens) × 3.2` characters, capped
-  at 24K (about 21K characters with `max_tokens` 1200, 12K with the default 4096). OpenRouter
-  allows 200K and Gemini 1.5M characters. Input over a provider's budget moves to the next
-  provider without a network call, so **a smaller `max_tokens` keeps more work on free Groq**.
+- **Input budgets.** Groq's free tier gives every model its own token bucket (8K tokens per
+  minute, refilling continuously) and does not charge `max_tokens` up front, only the real
+  prompt and completion. A request is admitted when the bucket holds its input tokens, so the
+  per-request input limit is `min(TPM, ITPM) − 200` tokens (about 24K characters; qwen has a
+  separate 7000-token input limit, learned from errors and kept in `state.json`). When the bucket
+  is short the call waits the exact refill time (at most 30 s), otherwise it moves on to the next
+  pool model or provider. OpenRouter allows 200K and Gemini 1.5M characters; input over a
+  provider's limit moves to the next provider without a network call.
 
 ## Measured token savings
 
@@ -227,8 +260,11 @@ ai-workers open                  open the dashboard in the browser
 ai-workers usage [--json]        remaining-quota report
 ai-workers status                providers and roles
 ai-workers roles [-v]            defined roles
-ai-workers run <role> "<task>" [-f path ...]     one job; piped stdin is the input (ignored with -f)
-ai-workers fanout <role> "<task>" [-f glob ...]  one job per stdin line or per file
+ai-workers run <role> "<task>" [-f path ...] [-o file] [--no-cache]
+                                 one job; piped stdin is the input (ignored with -f);
+                                 -o writes the answer to a file and prints path + preview
+ai-workers fanout <role> "<task>" [-f glob ...] [--output-dir dir] [--reduce "<task>"] [--no-cache]
+                                 one job per stdin line or per file; --reduce merges the outputs
 ai-workers models <provider>     live model list
 ai-workers serve                 run the dashboard backend in the foreground
 ai-workers start|stop|restart|logs   manage the background service
@@ -239,6 +275,8 @@ ai-workers doctor                check the installation
 echo "Merhaba dünya" | ai-workers run translator "Translate to English."
 ai-workers fanout summarizer "Summarize the file" -f '~/code/myapp/docs/*.md' -c 4
 ```
+
+`--max-tokens` defaults to auto (sized per role); `fanout -c` defaults to 6.
 
 `install.sh` installs `~/.local/bin/ai-workers`, a `systemd --user` service for the dashboard
 backend (started on login) and the `io.github.msozturktr.AiWorkers` desktop entry with its icon.
@@ -275,15 +313,15 @@ OPENROUTER_API_KEY=...    # https://openrouter.ai/keys
 
 | key      | meaning |
 |----------|---------|
-| `roles`  | override fields of a built-in role or add new roles (`provider`, `model`, `system`, `whole_files`, `reasoning_effort`) |
+| `roles`  | override fields of a built-in role or add new roles (`provider`, `model`, `system`, `whole_files`, `reasoning_effort`, `max_tokens`, `min_tokens`, `out_ratio`) |
 | `trace`  | activity log on/off, retention in days, size cap in MB |
 | `limits` | Gemini quotas per model (Gemini does not report them; copy them from AI Studio → Rate limits). `limits.gemini.free_tier_models` holds the free-tier limits for the "X/Y free remaining" hint |
 | `port`   | dashboard port (default 8765, or `AI_WORKERS_PORT`) |
 
 Other files in the directory are written by ai-workers: `ledger.jsonl` (one line per request:
 time, provider, model, role, tokens, error), `ratelimit.json` (latest Groq rate-limit headers),
-`claude_live.json` (cached Claude limits), `results/` (oversized tool results) and `trace/`
-(activity log).
+`claude_live.json` (cached Claude limits), `state.json` (cooldowns, learned token ratios),
+`cache/` (7-day result cache), `results/` (oversized tool results) and `trace/` (activity log).
 
 ## Quota tracking
 
@@ -311,12 +349,21 @@ Gemini model goes past its free-tier limits.
   failures.
 - When a role's provider fails (missing key, input too large, error), the job falls back to the
   other providers. In a `fanout`, one failing job never affects the others.
-- Groq's per-minute token budget is tracked in the server: a request waits (up to 30 s) until
-  the last minute's usage leaves room for it instead of hitting 429 and falling back to paid
-  Gemini. The limit is learned from Groq's rate-limit headers. `fanout` runs 4 jobs at a time by
-  default.
-- Mechanical roles (`classifier`, `translator`, `extractor`) ask Groq's gpt-oss models for
-  `reasoning_effort: low`, which cut reasoning tokens by ~60% in tests without hurting the answer.
+- Groq's per-model token bucket is tracked in the server and synced from the
+  `x-ratelimit-remaining-tokens` headers. A request waits up to 30 s for free capacity (it also
+  parses "try again in Xs" from 429 bodies); if the bucket will not refill in time the job moves
+  to the next model or provider instead of hitting 429 and falling back to paid Gemini.
+  `fanout` runs 6 jobs at a time by default (max 12). Measured: a fanout over 9 source files
+  went from 103 s to 24 s after the limiter was rewritten.
+- Cooldowns (circuit breaker): a model that returns a daily limit, a long `Retry-After` or
+  `model_not_found` is skipped until the cooldown ends. Cooldowns and the learned
+  characters-per-token ratios (per provider/model and script class, ASCII or international) are
+  persisted in `~/.config/ai-workers/state.json`.
+- HTTP connections are kept alive and pooled (a small Groq call dropped from ~0.32 s to ~0.16 s).
+  Set `AI_WORKERS_NO_KEEPALIVE=1` to disable it.
+- Mechanical roles (`classifier`, `translator`, `extractor`) and `summarizer` ask Groq's gpt-oss
+  models for `reasoning_effort: low`, which cut reasoning tokens by ~60% in tests without hurting
+  the answer (for `summarizer`: -22% output tokens, -30% latency).
 - Results larger than 60K characters (Claude Code rejects tool results above ~25K tokens) are
   truncated; the full text is saved under `~/.config/ai-workers/results/` (newest 50 kept) and
   the path is returned so it can be condensed by a worker.
@@ -331,7 +378,8 @@ Gemini model goes past its free-tier limits.
 
 ```
 server.py      MCP server (JSON-RPC over stdio): tools, instructions, threading
-providers.py   provider client: retries, fallback, budgets, ledger, role loading
+providers.py   provider client: routing (model pool, fallback), limiter, cooldowns, keep-alive, ledger, role loading
+cache.py       disk result cache (7-day TTL)
 sources.py     file feeding: path/glob resolution, secret filter, chunking
 activity.py    activity log: span tree writer, retention, incremental reader
 usage.py       remaining-quota snapshot for every provider and Claude
@@ -371,6 +419,22 @@ printf '%s\n' \
 
 Contributions are welcome. Please keep the project dependency-free and add a test for any
 behavior change.
+
+## Changelog
+
+### 1.6.0
+
+- Routing: role model, then same-provider pool (Groq gpt-oss-120b, qwen3.8-27b, gpt-oss-20b), then other providers.
+- Automatic `max_tokens` per role (`max_tokens`, `min_tokens`, `out_ratio`).
+- Token-bucket limiter synced from rate-limit headers; waits up to 30 s, else next provider.
+- Cooldowns and learned chars-per-token ratios persisted in `state.json`.
+- 7-day result cache (`no_cache` to skip); cache hits counted in the usage report.
+- `output_file` / `output_dir` / `overwrite`: write results to disk, return path + preview.
+- `fanout` `reduce` / `reduce_role`: map-reduce into one answer.
+- `fanout` packing of short classifier/extractor/translator items (up to 20 per request).
+- Keep-alive HTTP pool (`AI_WORKERS_NO_KEEPALIVE=1` disables it); default fanout concurrency 6.
+- CLI: `run -o/--no-cache`, `fanout --output-dir/--reduce/--no-cache`, `--max-tokens` auto.
+- `summarizer` uses `reasoning_effort: low`; usage report gains per-model Groq buckets and an Efficiency section.
 
 ## License
 

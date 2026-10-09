@@ -312,7 +312,10 @@ AW.attemptPayload = (a, tab) => {
 AW.noteText = (nt, provider) => nt.name === 'retry'
   ? t('retry_note', { n: nt.attempt, why: nt.http ? t('http_n', { n: nt.http }) : t('error_word'), d: dfmt(nt.delay) })
   : nt.name === 'throttle' ? t('throttle_note', { d: dfmt(nt.waited), p: provider || 'provider' })
-  : nt.name === 'fallback' ? t('fallback_note', { p: nt.provider, next: (nt.next || []).join(', ') }) : `${nt.name}`;
+  : nt.name === 'cache' ? t('cache_note', { p: [nt.provider, nt.model].filter(Boolean).join('/') || 'provider' })
+  : nt.name === 'fallback' ? (Array.isArray(nt.route)
+    ? t('fallback_route', { r: nt.route.map(x => `${x.provider}${x.model ? '/' + x.model : ''}: ${String(x.error || '').slice(0, 80)}`).join(' · ') })
+    : t('fallback_note', { p: nt.provider, next: (nt.next || []).join(', ') })) : `${nt.name}`;
 
 /* provider groups of a call for flow diagrams */
 AW.stations = d => {
