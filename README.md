@@ -11,8 +11,8 @@ translation, classification and log scanning goes to cheap or free API models
 (Groq, Gemini, OpenRouter).
 
 The main trick is **file feeding**: Claude passes only paths, the server reads the files and
-returns only the worker's answer, so file contents never enter Claude's context. In a measured
-run this cut Claude-side tokens by **~85%** ([details](#measured-token-savings)).
+returns only the worker's answer, so file contents never enter Claude's context. In measured
+runs this cut Claude-side tokens by **~90-99%** ([details](#measured-token-savings)).
 
 - **No dependencies.** Server, CLI and dashboard use the Python standard library only.
 - **Resilient.** Same-provider model pool, then fallback across providers, a token-bucket
@@ -165,32 +165,45 @@ fanout(role="classifier", task="...", files=["~/code/myapp/src/**/*.py"])
 
 ## Measured token savings
 
-Measured on 2026-10-08 from Claude Code's own transcript (the `usage` of consecutive assistant
-messages, i.e. how much each step grew Claude's context). Task: summarize 4 C# source files
-(a game project's drivetrain module, ~47K characters, ~1,100 lines) in 3-5 bullets each.
+Re-measured on 2026-10-10 (v1.6.1) from Claude Code's own transcript: a Claude Sonnet subagent
+ran each task both ways in one session, and the per-message `usage` shows how much each step
+grew its context (tool results in, tool calls and answers out). Three task shapes:
 
-| Claude-side tokens                           | Claude does it (`Read` x4 + writes summaries) | Delegated (`fanout(files=...)`) | Saving   |
-|----------------------------------------------|----------------------------------------------:|--------------------------------:|---------:|
-| Input added to context                       | ~23,900 (file contents)                       | ~4,250 (worker summaries)       |          |
-| Output                                       | ~4,200 (summaries, assumed same length)       | ~70 (the tool call)             |          |
-| **Total tokens**                             | **~28,100**                                   | **~4,320**                      | **~85%** |
-| Cost-weighted (output x5, cache write x1.25) | ~50,900                                       | ~5,700                          | **~89%** |
-| Carried into every later turn (cache read)   | ~28,100                                       | ~4,250                          | ~85%     |
+| Task | Claude does it | Delegated | Saving | Cost-weighted* |
+|---|---:|---:|---:|---:|
+| **Summarize** 4 C# files (47K chars) in 3-5 bullets each — `fanout(files=...)` | 24,206 in (`Read` x4) + ~990 out = **~25,200** | **~2,470** | **~90%** | ~91% |
+| **Scan** 8 C# files (174K chars): which methods compute tire forces — `fanout(..., drop_none=true)` | 91,988 in (`Read` x8) + the answer** = **~92,000+** | **~900** | **~99%** | ~99% |
+| **Translate** a 6.4K-char Markdown doc to Turkish — `delegate(..., output_file=...)` | 2,572 in (`Read`) + ~3,600 out (`Write`) = **~6,200** | **~510** | **~92%** | ~96% |
 
-Worker side: 6 of 7 jobs ran on Groq for free; 1 hit Groq's 8K tokens/minute limit and fell
-back to Gemini (~3.5K input tokens, paid Tier 1).
+\* Input as a cache write (x1.25), output x5. ** The scan answer itself was not counted; it is
+small next to the reads.
 
-What the number depends on:
+The context that is avoided is also not carried into later turns: after these three tasks the
+"Claude does it" context was ~123K tokens larger, the delegated one ~3.9K.
+
+Compared with the first measurement (2026-10-08, same 4 files): the delegated cost of the
+summary task fell from ~4,320 to ~2,470 tokens (compact result metadata, automatic
+`max_tokens`), so the saving rose from ~85% to ~90%.
+
+Worker side: the summaries ran on Groq for free (4 models of the pool); the translation on Groq
+too. The scan ran on Gemini flash-lite because of a bug this run uncovered (fixed in 1.6.2:
+`NONE` answers failed `extractor` JSON validation and walked the fallback chain).
+
+What the numbers depend on:
 
 - **Input/output ratio.** Savings are largest when a lot is read and little comes back
-  (summaries, classification, log scanning). When the output is as long as the input
-  (translation, drafts) it still lands in Claude's context; write it to a file instead, e.g.
-  `ai-workers run translator "..." -f doc.md > out.md`.
-- **Verification is not counted.** Worker output is an unreviewed draft; spot-checking it costs
-  Claude tokens.
-- **Chunking hurt quality** in this run: chunks of a large file lacked context and the worker
-  guessed API names that do not exist. Understanding-type roles now send whole files.
-- Single measurement (n=1): treat it as an order of magnitude, not a constant.
+  (summaries, scans, classification, log scanning). When the output is as long as the input
+  (translation, drafts), have it written to a file (`output_file`) so only the path and a
+  short preview come back.
+- **The baseline is "read everything".** For a scan whose answer can be found by keyword,
+  `Grep` plus a few targeted reads is far cheaper than reading 8 files; delegation wins when the
+  question is semantic.
+- **Verification is not counted.** Worker output is an unreviewed draft. In this run the scan
+  found the core methods (`Corner.UpdateTire`, `Corner.ComputeForces`, `Wheel.Integrate`) but
+  also listed a call site as a method; spot-checking costs Claude tokens.
+- **Chunking hurts understanding.** Chunks of a large file lack context and workers guess API
+  names; understanding-type roles send whole files.
+- One run per task: treat the figures as an order of magnitude, not a constant.
 
 ## Desktop app
 
@@ -431,6 +444,13 @@ Contributions are welcome. Please keep the project dependency-free and add a tes
 behavior change.
 
 ## Changelog
+
+### 1.6.2
+
+- `NONE` answers pass `extractor` JSON validation (plain or fenced) instead of walking the whole fallback chain; `drop_none` also omits fenced `NONE` (measured: the 8-file scan returned 804 instead of 1,357 chars, no fallback for NONE jobs).
+- A worker echoing the `### FILE: <name>` input header as its first line is stripped (affected `output_file` translations).
+- Themes: Mission Control trajectory schematic no longer overlaps with 4+ stations, top bar wraps on narrow windows, console font for warning strips, telemetry rows start under the header, call title shows the call id; Synthwave flow diagram groups attempts per provider/model with ok/failed/skipped counts, full token KPI, 2-column KPIs on narrow windows; Modern attempts KPI with a sub-line; the efficiency line hides the cache part when there were no cache hits.
+- Token savings re-measured on three task shapes (summary ~90%, scan ~99%, translation ~92%).
 
 ### 1.6.1
 

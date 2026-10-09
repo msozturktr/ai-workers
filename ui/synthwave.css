@@ -238,7 +238,7 @@ button, input, select { font:inherit; color:inherit; }
 .dag-arrow { display:flex; align-items:center; flex:none; }
 .dag-arrow svg { width:20px; height:20px; }
 .targets { display:flex; flex-direction:column; gap:8px; flex:none; }
-.target { padding:6px 12px; border-radius:4px; display:flex; align-items:center; justify-content:space-between; gap:12px; min-width:260px; cursor:pointer; }
+.target { padding:6px 12px; max-width:290px; border-radius:4px; display:flex; align-items:center; justify-content:space-between; gap:12px; min-width:200px; cursor:pointer; }
 .target.ok { background:var(--cont); border:1px solid var(--mint); box-shadow:0 0 12px rgba(5,255,161,.25); }
 .target.bad { background:var(--low); border:1px dashed rgba(255,78,123,.6); opacity:.75; }
 .target.skip { background:var(--low); border:1px dashed var(--outline-var); opacity:.6; }
@@ -250,6 +250,7 @@ button, input, select { font:inherit; color:inherit; }
 .tbadge.run { background:rgba(111,242,255,.15); border-color:var(--secondary); color:var(--secondary); }
 .kgrid { display:grid; grid-template-columns:repeat(6, 1fr); gap:8px; }
 .kbox { padding:10px; border-radius:4px; background:var(--lowest); border:1px solid var(--outline-var); display:flex; flex-direction:column; min-width:0; }
+.kbox .v span { display:block; overflow:hidden; text-overflow:ellipsis; }
 .kbox .v { font-family:var(--f-mono); font-size:18px; line-height:24px; font-weight:700; margin-top:4px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .wf-hdr { display:flex; align-items:center; justify-content:space-between; gap:10px; }
 .wf-hdr h2 { margin:0; display:flex; align-items:center; gap:6px; color:var(--tertiary); font-weight:700; text-transform:uppercase; }
@@ -263,6 +264,9 @@ button, input, select { font:inherit; color:inherit; }
 .wgrid.row.sel { background:rgba(38,25,58,.8); box-shadow:inset 3px 0 var(--secondary); }
 .wgrid.row.bad { background:rgba(147,0,10,.05); }
 .wgrid .job { display:flex; align-items:center; gap:6px; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.wgrid .wmodel { min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.wgrid > div { min-width:0; }
+.tgt-name { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .wgrid .r { text-align:right; white-space:nowrap; }
 .wlane { width:100%; height:12px; border-radius:4px; background:rgba(60,46,80,.4); position:relative; overflow:hidden; }
 .wlane i { position:absolute; top:0; bottom:0; border-radius:4px; min-width:3px; }
@@ -303,3 +307,4 @@ button, input, select { font:inherit; color:inherit; }
 .term-body dd { margin:0; word-break:break-word; }
 #aw-toast { background:var(--primary-c) !important; color:var(--surface) !important; font-family:var(--f-mono) !important; box-shadow:0 0 14px rgba(255,78,123,.5); }
 @media (max-width:1200px) { .sw-split { grid-template-columns:1fr; } .kgrid { grid-template-columns:repeat(3, 1fr); } .sw-hero .kpis { grid-template-columns:1fr; } }
+@media (max-width:1200px) and (min-width:600px) { .sw-hero .kpis { grid-template-columns:1fr 1fr; } .kpi-pod { min-width:0; } .kpi-pod.alert { grid-column:1/-1; } }

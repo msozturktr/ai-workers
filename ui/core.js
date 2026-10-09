@@ -45,7 +45,7 @@ const esc = AW.esc = s => String(s ?? '').replace(/[&<>"']/g, c =>
   ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
 AW.effText = e => e ? {
   share: t('eff_free_share', { pct: e.free_pct, free: e.free, jobs: e.jobs }),
-  cache: t('eff_cache', { n: e.cache_hits || 0, tok: AW.kfmt(e.tokens_saved || 0) }) } : null;
+  cache: e.cache_hits ? t('eff_cache', { n: e.cache_hits, tok: AW.kfmt(e.tokens_saved || 0) }) : null } : null;
 AW.kfmt = v => v == null ? '—' : v >= 1e6 ? (v / 1e6).toFixed(1) + 'M' : v >= 1e3 ? (v / 1e3).toFixed(1) + 'K' : String(v);
 const dfmt = AW.dfmt = s => s == null ? '—' : s < 1 ? Math.round(s * 1000) + ' ms'
   : s < 60 ? s.toFixed(1) + ' s' : Math.floor(s / 60) + 'm ' + String(Math.round(s % 60)).padStart(2, '0') + 's';

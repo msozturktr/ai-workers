@@ -115,7 +115,7 @@ function renderUsage() {
     <div><div class="kpi-v">${n(m.kpis.req)}</div><div class="kpi-l">${t('kpi_req_today')}</div></div>
     <div><div class="kpi-v">${n(m.kpis.tok)}</div><div class="kpi-l">${t('kpi_tok_today')}</div></div>
     <div><div class="kpi-v" style="${m.kpis.fail ? 'color:var(--critical)' : ''}">${n(m.kpis.fail)}</div><div class="kpi-l">${t('kpi_failed')}</div></div>`
-    + (m.efficiency ? `<div class="kpi-l" style="flex-basis:100%;margin-top:-10px;text-transform:none">${esc(AW.effText(m.efficiency).share)} · ${esc(AW.effText(m.efficiency).cache)}</div>` : '');
+    + (m.efficiency ? `<div class="kpi-l" style="flex-basis:100%;margin-top:-10px;text-transform:none">${esc(Object.values(AW.effText(m.efficiency)).filter(Boolean).join(' · '))}</div>` : '');
 
   const c = m.claude;
   let ch = '';
@@ -304,7 +304,7 @@ function renderDetail() {
     [t('f_from'), esc(AW.who(sess)) + (sess.client ? `<div class="fact-l" style="text-transform:none;letter-spacing:0">${esc(sess.client)}</div>` : '')],
     [t('f_project'), esc(s.project || '—')],
     [t('f_jobs'), s.jobs ? `${s.jobs_done}/${s.jobs}` : '—'],
-    [t('f_attempts'), s.attempts ? `${s.attempts}${s.failed_attempts ? ` <span style="color:var(--serious);font-weight:500">${t('n_failed_p', { n: s.failed_attempts })}</span>` : ''}${s.skipped_attempts ? ` <span style="color:var(--muted);font-weight:500">${t('n_skipped_p', { n: s.skipped_attempts })}</span>` : ''}` : '—'],
+    [t('f_attempts'), s.attempts ? String(s.attempts) : '—', [s.failed_attempts ? `<div class="fact-s" style="color:var(--serious)">${t('n_failed_p', { n: s.failed_attempts })}</div>` : '', s.skipped_attempts ? `<div class="fact-s">${t('n_skipped_p', { n: s.skipped_attempts })}</div>` : ''].join('')],
     [t('f_tokens'), s.tokens.in || s.tokens.out ? `${n(s.tokens.in)} → ${n(s.tokens.out)}` : '—'],
   ];
   const params = Object.entries(req).filter(([k]) => !PAYLOAD_KEYS.includes(k));
@@ -314,7 +314,7 @@ function renderDetail() {
       <div class="d-actions"><span class="pill"><span class="st ${esc(d.status)}"></span>${esc(AW.stLabel(d.status))}</span>
         <button data-act="copy-json" title="${esc(t('copy_json_title'))}">${t('copy_json')}</button></div></div>
     ${flowHTML(d)}
-    <div class="facts">${facts.map(([l, v]) => `<div><div class="fact-v">${v}</div><div class="fact-l">${l}</div></div>`).join('')}</div>
+    <div class="facts">${facts.map(([l, v, x]) => `<div><div class="fact-v">${v}</div><div class="fact-l">${l}</div>${x || ''}</div>`).join('')}</div>
     ${d.status === 'abandoned' ? `<div class="warnbox">${esc(t('abandoned_txt', { pid: sess.pid }))}</div>` : ''}
     <h3>${esc(t('request_from', { w: AW.who(sess) }))}</h3>
     ${params.length ? '<dl class="params">' + params.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${Array.isArray(v) ? v.map(x => esc(typeof x === 'string' ? x : JSON.stringify(x))).join('<br>') : esc(typeof v === 'string' ? v : JSON.stringify(v))}</dd>`).join('') + '</dl>' : ''}

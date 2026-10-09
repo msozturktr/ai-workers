@@ -117,7 +117,7 @@ function overviewHTML() {
           ${tg ? `<span class="t-lbl-md c-pri" style="background:rgba(255,78,123,.2);padding:2px 8px;border:1px solid var(--primary-c);border-radius:4px">${esc(U(st.label))}</span>` : ''}</div>
         <p class="t-lbl-md c-var" style="margin:8px 0 0">${esc(label)}${tg && tg.resets ? ` · ${esc(t('resets_at', { t: '' }).trim())} <span class="c-sec" style="font-weight:600">${esc(tg.resets)}</span>` : ''}</p></div>
       <div class="kpis">
-        ${m.efficiency ? `<div class="kpi-pod" style="grid-column:1/-1;min-width:0"><span class="t-lbl-sm c-sec">${esc(AW.effText(m.efficiency).share)}</span><span class="t-lbl-sm c-var" style="margin-top:4px">${esc(AW.effText(m.efficiency).cache)}</span>${bar(m.efficiency.free_pct, 'bg-sec', '#6ff2ff')}</div>` : ''}
+        ${m.efficiency ? `<div class="kpi-pod" style="grid-column:1/-1;min-width:0"><span class="t-lbl-sm c-sec">${esc(AW.effText(m.efficiency).share)}</span>${AW.effText(m.efficiency).cache ? `<span class="t-lbl-sm c-var" style="margin-top:4px">${esc(AW.effText(m.efficiency).cache)}</span>` : ''}${bar(m.efficiency.free_pct, 'bg-sec', '#6ff2ff')}</div>` : ''}
         <div class="kpi-pod"><span class="t-lbl-sm c-var up">${esc(U(t('sw_req_traffic')))}</span>
           <div class="row"><span class="t-h-lg c-on">${n(m.kpis.req)}</span><span class="t-lbl-sm c-sec">${esc(U(t('sw_today')))}</span></div>${bar(reqCap ? m.kpis.req / reqCap * 100 : 0, 'bg-sec', '#6ff2ff')}</div>
         <div class="kpi-pod"><span class="t-lbl-sm c-var up">${esc(U(t('sw_tok_consumption')))}</span>
@@ -235,10 +235,26 @@ function targetHTML(a, k) {
     <span class="tbadge ${cls}">${esc(badge)}</span></div>`;
 }
 
+function groupHTML(g) {
+  const cls = g.running ? 'run' : g.ok ? 'ok' : g.error ? 'bad' : 'skip', tot = g.ok + g.error + g.skipped + g.running;
+  const parts = [g.ok ? t('sw_g_ok', { n: g.ok }) : null, g.error ? t('sw_g_bad', { n: g.error }) : null, g.skipped ? t('sw_g_skip', { n: g.skipped }) : null, g.running ? t('s_running') : null].filter(Boolean);
+  const tk = g.tin || g.tout ? `${kfmt(g.tin)}→${kfmt(g.tout)} ${t('tok')}` : null;
+  return `<div class="target ${cls}" style="cursor:default"><div style="min-width:0">
+      <div class="t-lbl-sm tgt-name ${g.ok ? 'c-mint' : g.running ? 'c-sec' : 'c-pri-c'}" style="font-weight:${g.ok ? 700 : 500}" title="${esc(g.provider + ' / ' + (g.model || ''))}">${esc(g.provider)} / ${esc(g.model || '')}</div>
+      <div class="t-lbl-sm c-out">${esc([...parts, tk].filter(Boolean).join(' · '))}</div></div>
+    <span class="tbadge ${cls}">${g.ok}/${tot}</span></div>`;
+}
+
 function dagHTML(d) {
   const sess = d.session || {}, atts = AW.attempts(d), jobs = AW.jobs(d);
   const fb = jobs.filter(j => j.fallback).length + (atts.some(a => a.status === 'skipped') && !jobs.some(j => j.fallback) ? 1 : 0);
-  const shown = atts.length > 6 ? atts.filter(a => a.status !== 'ok').slice(0, 3).concat(atts.filter(a => a.status === 'ok').slice(0, 3)) : atts;
+  const grouped = jobs.length > 1, CAP = 5;
+  const grp = grouped ? AW.stations(d).sort((x, y) => (y.ok > 0) - (x.ok > 0) || y.ok - x.ok || y.error - x.error) : [];
+  const live = atts.filter(a => a.status !== 'skipped'), skipN = atts.length - live.length;
+  const single = (live.length ? live : atts).slice(0, CAP);
+  const nodes = grouped ? grp.slice(0, CAP).map(groupHTML).join('') : single.map(a => targetHTML(a, atts.indexOf(a) + 1)).join('');
+  const more = grouped ? grp.length - Math.min(grp.length, CAP) : (live.length ? live : atts).length - single.length;
+  const skipTxt = !grouped && live.length && skipN ? t('sw_g_skip', { n: skipN }) : '';
   const bad = ['error', 'abandoned'].includes(d.status);
   return `<div class="dag"><div style="display:flex;align-items:center;justify-content:space-between">
       <span class="t-lbl-sm c-ter-fixed up" style="font-weight:700;letter-spacing:.08em;display:flex;align-items:center;gap:4px">${I.tree}${esc(U(t('sw_dag')))}</span>
@@ -247,8 +263,8 @@ function dagHTML(d) {
       <div class="node src"><div class="k">${esc(U(t('sw_source')))}</div><div class="v">${esc(AW.who(sess))}</div><div class="s">${esc(sess.cwd ? t('sw_workspace', { p: sess.cwd.split('/').pop() }) : sess.client || '—')}</div></div>
       <div class="dag-arrow c-sec">${I.arrow}</div>
       <div class="node dsp"><div class="k">${esc(U(t('sw_dispatch')))}</div><div class="v">ai-workers</div><div class="s">${esc(`${d.tool} · ${jobs.length ? AW.tp('jobs_n', jobs.length) : t('local')}`)}</div></div>
-      ${atts.length ? `<div class="dag-arrow c-pri-c">${I.fork}</div><div class="targets">${shown.map(a => targetHTML(a, atts.indexOf(a) + 1)).join('')}
-        ${atts.length > shown.length ? `<div class="t-lbl-sm c-out">+${atts.length - shown.length}</div>` : ''}</div>` : ''}
+      ${atts.length ? `<div class="dag-arrow c-pri-c">${I.fork}</div><div class="targets">${nodes}
+        ${more > 0 ? `<div class="t-lbl-sm c-out">+${more}</div>` : ''}${skipTxt ? `<div class="t-lbl-sm c-out">${esc(skipTxt)}</div>` : ''}</div>` : ''}
       <div class="dag-arrow c-orange">${I.arrow}</div>
       <div class="node ret${bad ? ' bad' : ''}"><div class="k">${esc(U(t('sw_return')))}</div><div class="v">${esc(t('result_to', { w: AW.who(sess) === 'CLI' ? 'CLI' : 'Claude' }))}</div>
         <div class="s">${esc(d.status === 'running' ? t('result_pending') : d.result ? t('chars_n', { n: n(d.result.size) }) : AW.stLabel(d.status))}</div></div>
@@ -271,7 +287,7 @@ function waterfallHTML(d) {
       return `<div class="wgrid row${cur === a ? ' sel' : ''}${bad ? ' bad' : ''}" data-att="${a.id}">
         <div class="job"><span class="dot d6 ${dotFor(a.status)}"></span><span class="c-on" style="${a.status === 'ok' ? 'font-weight:600' : ''}">${esc(j.label || t('job_word'))}</span>
           ${ja.length > 1 ? `<span class="${a.status === 'ok' ? 'c-sec' : 'c-out'}">(${esc(t('sw_att_short', { n: i + 1 }))})</span>` : ''}</div>
-        <div class="${a.status === 'ok' ? 'c-on' : 'c-out'}">${esc(j.role || '—')} → <span class="${a.status === 'ok' ? 'c-sec' : bad ? 'c-pri-c' : 'c-out'}" style="font-weight:${a.status === 'ok' ? 700 : 400}">${esc(a.provider + '/' + (a.model || ''))}</span></div>
+        <div class="wmodel ${a.status === 'ok' ? 'c-on' : 'c-out'}" title="${esc((j.role || '—') + ' → ' + a.provider + '/' + (a.model || ''))}">${esc(j.role || '—')} → <span class="${a.status === 'ok' ? 'c-sec' : bad ? 'c-pri-c' : 'c-out'}" style="font-weight:${a.status === 'ok' ? 700 : 400}">${esc(a.provider + '/' + (a.model || ''))}</span></div>
         <div><div class="wlane">${wait}<i class="${a.status}" style="left:${L(a.ts).toFixed(2)}%;width:${W(a.ts, a.end || nowS()).toFixed(2)}%" title="${esc(AW.stLabel(a.status) + ' · ' + dfmt(a.dur ?? nowS() - a.ts))}"></i></div></div>
         <div class="r ${bad ? 'c-pri-c' : a.status === 'ok' ? 'c-sec' : 'c-out'}" style="font-weight:700">${a.status === 'running' ? `<span data-since="${a.ts}">${dfmt(nowS() - a.ts)}</span>` : esc(dfmt(a.dur))}</div>
         <div class="r ${a.status === 'ok' ? 'c-mint' : 'c-out'}">${tok.in || tok.out ? `${kfmt(tok.in)} → ${kfmt(tok.out)}` : '0 → 0'}</div></div>`;
@@ -333,7 +349,7 @@ function inspectHTML() {
         ${kbox(t('f_project'), esc(s.project || '—'), `pid ${sess.pid ?? '—'}`, 'c-on')}
         ${kbox(t('sw_jobs_exec'), s.jobs ? `${s.jobs_done}/${s.jobs}` : '—', pctDone === null ? '—' : t('sw_completed', { p: pctDone }), pctDone === 100 ? 'c-mint' : 'c-sec')}
         ${kbox(t('f_attempts'), esc(U(AW.tp('sw_attempts_n', s.attempts))), [s.failed_attempts ? t('failed_n', { n: s.failed_attempts }) : null, s.skipped_attempts ? t('skipped_n', { n: s.skipped_attempts }) : null].filter(Boolean).join(' · ') || t('sw_no_retries'), s.failed_attempts || s.skipped_attempts ? 'c-orange' : 'c-on')}
-        ${kbox(t('col_tokens'), s.tokens.in || s.tokens.out ? `${n(s.tokens.in)} → ${n(s.tokens.out)}` : '—', t('sw_in_out'), 'c-sec')}
+        ${kbox(t('col_tokens'), s.tokens.in || s.tokens.out ? `<span style="font-size:15px" title="${esc(n(s.tokens.in) + ' → ' + n(s.tokens.out))}">${kfmt(s.tokens.in)} → ${kfmt(s.tokens.out)}</span>` : '—', t('sw_in_out'), 'c-sec')}
       </div>
       ${d.status === 'abandoned' ? `<div class="note-strip pk">${esc(t('abandoned_txt', { pid: sess.pid }))}</div>` : ''}
       ${waterfallHTML(d)}

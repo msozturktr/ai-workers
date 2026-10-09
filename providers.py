@@ -4,7 +4,7 @@ import http.client, io, json, os, re, socket, threading, time, urllib.parse, url
 import activity as T
 import cache as C
 
-UA = "ai-workers/1.6.1 (+https://github.com/msozturktr/ai-workers) python-urllib"
+UA = "ai-workers/1.6.2 (+https://github.com/msozturktr/ai-workers) python-urllib"
 
 CONFIG_DIR = os.path.expanduser("~/.config/ai-workers")
 ENV_FILE = os.path.join(CONFIG_DIR, "env")
@@ -308,9 +308,36 @@ def strip_fence(text):
     return m.group(1).strip() if m else t
 
 
+_NONE_STRIP = "*`.\"' \t\r\n_-"
+
+
+def is_none(text):
+    """True when an answer is just NONE (ignoring case, whitespace, markdown/punctuation and a ``` fence)."""
+    t = strip_fence(text).strip(_NONE_STRIP)
+    return t.lower() == "none"
+
+
+_HDR_RE = re.compile(r"^### FILE: .*$", re.M)
+
+
+def strip_echoed_header(text, prompt):
+    """Drop a first line echoing a '### FILE: <label>' header that is really present in the prompt."""
+    if not text or not prompt:
+        return text
+    t = text.lstrip("\n")
+    first, sep, rest = t.partition("\n")
+    first = first.rstrip()
+    if first.startswith("### FILE: ") and first in _HDR_RE.findall(prompt):
+        return rest.lstrip("\n") if sep else ""
+    return text
+
+
 def _validate(spec, res):
     """Role output validation. Returns an error string, or None when ok (res["text"] may be normalised)."""
     if spec.get("validate") == "json":
+        if is_none(res.get("text")):
+            res["text"] = "NONE"
+            return None
         t = strip_fence(res.get("text"))
         try:
             json.loads(t)
@@ -949,6 +976,8 @@ def run(spec, prompt, max_tokens=None, model=None, no_fallback=False, role=None,
             _record_cached(hit, role)
             return hit
     res = _route(spec, prompt, max_tokens, model, no_fallback, role)
+    if res.get("ok") and isinstance(res.get("text"), str):
+        res["text"] = strip_echoed_header(res["text"], prompt)
     if key and res.get("ok") and not res.get("warning_note"):
         C.put(key, res)
     return res

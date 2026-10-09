@@ -133,7 +133,7 @@ function overviewHTML() {
         <div class="counter"><span class="lbl-sm">${esc(U(t('mc_tok_today')))}</span><div class="nixie-tube"><span class="nixie-digit">${pad(m.kpis.tok, 6)}</span></div><span class="sub">${esc(U(t('mc_sub_inout')))}</span></div>
         <div class="counter fail"><span class="lbl-sm">${esc(U(t('mc_failed')))}</span><div class="nixie-tube"><span class="nixie-digit red">${pad(m.kpis.fail, 4)}</span></div><span class="sub">${esc(U(t('mc_sub_today')))}</span></div>
       </div>
-      ${m.efficiency ? `<div class="plate ov hero-caption" style="margin-top:6px">${esc(U(AW.effText(m.efficiency).share))}<br>${esc(U(AW.effText(m.efficiency).cache))}</div>` : ''}
+      ${m.efficiency ? `<div class="plate ov eff-plate">${Object.values(AW.effText(m.efficiency)).filter(Boolean).map(x => `<span>${esc(U(x))}</span>`).join('')}</div>` : ''}
     </section>
     <section class="bay col-7">${SCREWS4SM}
       <div class="bay-hdr"><div class="plate ov">${esc(U(t('mc_fd_hdr')))}</div><span class="dymo ov">MON-BAY-FDIR</span></div>
@@ -161,7 +161,7 @@ function overviewHTML() {
         <div style="display:flex;align-items:center;gap:8px"><span class="dymo ov">${esc(U(t('mc_bank', { n: stations.length })))}</span>
           <span class="lbl-sm" style="color:${m.notes.length ? 'var(--amber)' : 'var(--ov-tertiary)'}">${esc(U(t(m.notes.length ? 'mc_bus_bad' : 'mc_bus')))}</span></div></div>
       <div class="stations">${stations.map(stationCard).join('')}</div>
-      ${m.notes.length ? `<div class="ov-notes">${m.notes.map(x => `<div class="caution-strip amber"><span class="lamp dot amber"></span><span>${esc(x)}</span></div>`).join('')}</div>` : ''}
+      ${m.notes.length ? `<div class="ov-notes">${m.notes.map(x => `<div class="caution-strip amber ov-note"><span class="lamp dot amber"></span><span>${esc(x)}</span></div>`).join('')}</div>` : ''}
       ${S.showTable ? tableHTML(m) : ''}
     </section>
     <section class="bay col-12 ctl-row">${SCREWS4SM}
@@ -242,10 +242,12 @@ function leftBayHTML() {
 }
 
 function trajectorySVG(d) {
-  const st = AW.stations(d).slice(0, 4), sess = d.session || {};
+  const all = AW.stations(d), st = all.slice(0, 4), sess = d.session || {};
+  const bh = st.length > 3 ? 26 : 30, step = st.length > 1 ? (112 - bh) / (st.length - 1) : 0;  /* box height / pitch: boxes never overlap */
+  const clip = (x, k) => x.length > k ? x.slice(0, k - 1) + '…' : x;
   const G = '#33ff66', A = '#ffb000', R = '#ff3b30', DIM = '#664d14';
   const col = s => s === 'ok' ? G : s === 'error' ? R : s === 'running' ? A : DIM;
-  const ys = st.length <= 1 ? [70] : st.map((_, i) => 26 + i * (90 / (st.length - 1)));
+  const ys = st.length <= 1 ? [70] : st.map((_, i) => 14 + bh / 2 + i * step);
   const callCol = d.status === 'ok' ? G : ['error', 'abandoned'].includes(d.status) ? R : A;
   let paths = `<path d="M 80 70 L 250 70" fill="none" stroke="${st.length || d.status === 'ok' ? G : A}" stroke-width="2.5" filter="url(#mc-glow-g)"/><polygon points="248,67 256,70 248,73" fill="${G}"/>`;
   let nodes = '';
@@ -255,15 +257,16 @@ function trajectorySVG(d) {
     if (!dashed) paths += `<polygon points="418,${y - 3} 426,${y} 418,${y + 3}" fill="${c}"/>`;
     if (g.status === 'ok') paths += `<path d="M 580 ${y} C 650 ${y}, 660 70, 712 70" fill="none" stroke="${G}" stroke-width="2.5" filter="url(#mc-glow-g)"/><polygon points="710,67 718,70 710,73" fill="${G}"/>`;
     const stat = U(t({ ok: 'mc_ok', error: 'mc_fail', skipped: 'mc_skipped', running: 'mc_running' }[g.status]));
-    const tok = g.tin || g.tout ? ` · ${kfmt(g.tin)}→${kfmt(g.tout)} TOK` : '';
-    nodes += `<g transform="translate(505, ${y})">
-      <rect x="-78" y="-15" width="156" height="30" fill="${g.status === 'ok' ? '#061f0e' : '#100d08'}" stroke="${c}" stroke-width="${g.status === 'ok' ? 2 : 1.5}"${g.status === 'ok' ? ' filter="url(#mc-glow-g)"' : ' stroke-dasharray="3 3"'} rx="2"/>
-      <circle cx="-62" cy="0" r="4" fill="${c}"/>
-      <text x="6" y="-2" text-anchor="middle" fill="${g.status === 'ok' ? G : '#a67c2e'}" font-family="Chakra Petch" font-size="10.5" font-weight="700" letter-spacing="1">${esc(U(t('mc_station', { p: '' })) + UD(g.provider))}</text>
-      <text x="6" y="10" text-anchor="middle" fill="${g.status === 'ok' ? '#b3ffca' : c}" font-family="Share Tech Mono" font-size="8.5">${esc(`${g.model || ''} · ${stat}${tok}`)}</text></g>`;
+    const tok = g.tin || g.tout ? `${kfmt(g.tin)}→${kfmt(g.tout)}` : '';
+    const sub = clip([clip(String(g.model || '').split('/').pop(), 14), g.status === 'ok' ? '' : stat, tok].filter(Boolean).join(' · '), 27);
+    nodes += `<g transform="translate(505, ${y})"><title>${esc(`${g.provider}/${g.model || ''} · ${stat} · ${g.ok}/${g.ok + g.error + g.skipped + g.running}`)}</title>
+      <rect x="-78" y="${-bh / 2}" width="156" height="${bh}" fill="${g.status === 'ok' ? '#061f0e' : '#100d08'}" stroke="${c}" stroke-width="${g.status === 'ok' ? 2 : 1.5}"${g.status === 'ok' ? ' filter="url(#mc-glow-g)"' : ' stroke-dasharray="3 3"'} rx="2"/>
+      <circle cx="-66" cy="0" r="3.5" fill="${c}"/>
+      <text x="6" y="${bh > 28 ? -2 : -1.5}" text-anchor="middle" fill="${g.status === 'ok' ? G : '#a67c2e'}" font-family="Chakra Petch" font-size="${bh > 28 ? 10.5 : 9.5}" font-weight="700" letter-spacing="1">${esc(clip(U(t('mc_station', { p: '' })) + UD(g.provider), 20))}</text>
+      <text x="6" y="${bh > 28 ? 10 : 8.5}" text-anchor="middle" fill="${g.status === 'ok' ? '#b3ffca' : c}" font-family="Share Tech Mono" font-size="8.5">${esc(sub)}</text></g>`;
   });
   if (!st.length && d.status !== 'running') paths += `<path d="M 290 70 L 712 70" fill="none" stroke="${callCol}" stroke-width="2" stroke-dasharray="2 4"/>`;
-  const more = AW.stations(d).length - st.length;
+  const more = all.length - st.length;
   return `<svg class="trajectory-svg" viewBox="0 0 830 140" preserveAspectRatio="xMidYMid meet">
     <defs><filter id="mc-glow-g" x="-20%" y="-20%" width="140%" height="140%"><feGaussianBlur stdDeviation="2.2" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>
     <ellipse cx="415" cy="70" rx="380" ry="60" fill="none" stroke="rgba(255,176,0,0.07)" stroke-dasharray="4 4"/>
@@ -373,13 +376,13 @@ function rightBayHTML() {
   const d = S.detail;
   if (!d) return `<div class="crt-casing" style="flex:1;display:flex"><div class="crt select-msg glow-a" style="flex:1">${S.detailMissing
     ? esc(U(t('not_found'))) + '<br>' + esc(t('not_found_txt')) : esc(U(t('select_title'))) + '<br><span class="text-dim">' + esc(t('select_txt')) + '</span>'}</div></div>`;
-  const s = d.summary, idx = S.calls.length - S.calls.findIndex(c => c.id === d.id);
+  const s = d.summary;
   const lampCls = d.status === 'ok' ? 'green' : d.status === 'running' ? 'amber' : ['error', 'abandoned'].includes(d.status) ? 'red' : 'amber';
   const lampCol = { green: '#33ff66', amber: '#ffb000', red: '#ff3b30' }[lampCls];
   const path = d.status === 'ok' ? 'mc_path_ok' : d.status === 'running' ? 'mc_path_run' : 'mc_path_fail';
   const dur = d.status === 'running' ? nowS() - d.ts : d.dur || 0;
   return `<div class="hdr-bar"><div style="display:flex;align-items:center;gap:10px;min-width:0">
-      <div class="dymo" style="font-size:12px;overflow:hidden;text-overflow:ellipsis" title="${esc(d.title || '')}">${esc(`${U(t('mc_call', { n: pad(idx > 0 && idx <= S.calls.length ? idx : 0, 3) }))} // ${UD(d.title || d.tool)}`)}</div>
+      <div class="dymo" style="font-size:12px;overflow:hidden;text-overflow:ellipsis" title="${esc(d.title || '')}">${esc(`${U(t('mc_call', { n: UD(String(d.id || '').slice(0, 6)) }))} // ${UD(d.title || d.tool)}`)}</div>
       <div style="display:flex;align-items:center;gap:5px;background:#0d1c10;border:1px solid ${lampCol}55;padding:2px 8px;border-radius:2px;flex:none">
         <div class="lamp dot ${lampCls}"></div><span style="font-size:10px;font-weight:700;color:${lampCol};letter-spacing:1px">${esc(callWord(d.status))}</span></div></div>
       <button class="btn-push" data-act="copy-json" style="padding:3px 10px;font-size:10px;flex:none">${ICON.copy} ${esc(U(t('copy_json')))}</button></div>
@@ -389,7 +392,7 @@ function rightBayHTML() {
     <div class="nixie-counter-bar">
       <div class="nixie-cell"><div class="plate">${esc(U(t('mc_duration')))}</div><div class="nixie-cluster" data-role="dur">${nixie(dur < 100 ? pad(dur.toFixed(1), 4) : Math.round(dur))}<span class="unit">S</span></div></div>
       <div class="nixie-cell"><div class="plate">${esc(U(t('mc_jobs')))}</div><div class="nixie-cluster">${nixie(`${s.jobs_done}/${s.jobs}`)}</div></div>
-      <div class="nixie-cell"><div class="plate">${esc(U(t('mc_attempts')))}</div><div class="nixie-cluster">${nixie(pad(s.attempts, 2))}${s.failed_attempts ? `<span class="note">(${esc(U(t('n_failed_p', { n: s.failed_attempts }).replace(/[()]/g, '')))})</span>` : ''}${s.skipped_attempts ? `<span class="note">(${esc(U(t('n_skipped_p', { n: s.skipped_attempts }).replace(/[()]/g, '')))})</span>` : ''}</div></div>
+      <div class="nixie-cell"><div class="plate">${esc(U(t('mc_attempts')))}</div><div class="nixie-cluster">${nixie(pad(s.attempts, 2))}${s.failed_attempts || s.skipped_attempts ? `<span class="notes">${s.failed_attempts ? `<span class="note">${esc(U(t('n_failed_p', { n: s.failed_attempts }).replace(/[()]/g, '')))}</span>` : ''}${s.skipped_attempts ? `<span class="note">${esc(U(t('n_skipped_p', { n: s.skipped_attempts }).replace(/[()]/g, '')))}</span>` : ''}</span>` : ''}</div></div>
       <div class="nixie-cell"><div class="plate">${esc(U(t('mc_tok_in')))}</div><div class="nixie-cluster">${nixie(pad(s.tokens.in, 4))}</div></div>
       <div class="nixie-cell"><div class="plate">${esc(U(t('mc_tok_out')))}</div><div class="nixie-cluster">${nixie(pad(s.tokens.out, 4))}</div></div>
     </div>

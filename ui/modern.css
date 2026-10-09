@@ -157,6 +157,7 @@
   .d-actions { display:flex; gap:6px; flex:none; }
   .facts { display:grid; grid-template-columns:repeat(auto-fill, minmax(140px, 1fr)); gap:14px 20px; margin:18px 0 6px; }
   .fact-v { font-size:15px; font-weight:600; font-variant-numeric:tabular-nums; word-break:break-word; }
+  .fact-s { color:var(--muted); font-size:11px; font-weight:500; margin-top:1px; }
   .fact-l { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.055em; margin-top:2px; }
   .flow { display:flex; align-items:center; gap:0; flex-wrap:wrap; margin:18px 0 4px; row-gap:8px; }
   .fnode { border:1px solid var(--grid); background:var(--surface); border-radius:9px; padding:7px 11px; font-size:12.5px; }

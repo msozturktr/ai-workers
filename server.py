@@ -13,7 +13,7 @@ import usage as U
 import sources as S
 
 PROTOCOL = "2025-06-18"
-SERVER = {"name": "ai-workers", "version": "1.6.1"}
+SERVER = {"name": "ai-workers", "version": "1.6.2"}
 
 INSTRUCTIONS = """ai-workers: cheap worker models (Groq/OpenRouter free, Gemini for big inputs) for mechanical text work, so Claude's tokens go to thinking.
 Hand off: summaries, translation, classification, extraction, log/test-output scanning, per-file analysis, first-pass review, drafts.
@@ -306,11 +306,6 @@ _PACK_INSTR = ("Apply the task above to EACH numbered item independently. Reply 
 _NONE_SUFFIX = "\n\nIf the input contains nothing relevant to this task, reply with exactly NONE."
 
 
-def _is_none(text):
-    """True when an answer is just NONE (ignoring case, whitespace, surrounding punctuation/markdown)."""
-    return (text or "").strip().strip("*`.\"' \t\r\n").strip().lower() == "none"
-
-
 def _pack_eligible(jobs, pack, drop_none=False):
     """Packing needs one shared role+task, no per-item model and plain-text inputs."""
     if pack is False or not jobs:
@@ -532,7 +527,7 @@ def t_fanout(a):
     good = [(j, r) for j, r in results if r.get("ok") and not r.get("warning")]
     none_idx = set()
     if drop_none:
-        none_idx = {j["idx"] for j, r in good if _is_none(r.get("text"))}
+        none_idx = {j["idx"] for j, r in good if P.is_none(r.get("text"))}
         good = [(j, r) for j, r in good if j["idx"] not in none_idx]
     dn_note = f", {len(good)} with results ({len(none_idx)} NONE omitted)" if drop_none else ""
 
