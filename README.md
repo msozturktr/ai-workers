@@ -268,7 +268,7 @@ ai-workers fanout <role> "<task>" [-f glob ...] [--output-dir dir] [--reduce "<t
 ai-workers models <provider>     live model list
 ai-workers serve                 run the dashboard backend in the foreground
 ai-workers start|stop|restart|logs   manage the background service
-ai-workers doctor                check the installation
+ai-workers doctor [--live] [--no-openrouter]   check the installation; --live probes every routable model
 ```
 
 ```bash
@@ -366,10 +366,13 @@ Gemini model goes past its free-tier limits.
   the answer (for `summarizer`: -22% output tokens, -30% latency).
 - Gemini 3.x flash models think by default and bill the hidden thinking tokens. Measured on a
   10K-token input with `max_tokens` 4096: default 19.6 s with ~3,900 thinking tokens (the answer
-  was truncated), `reasoning_effort: low` 18.0 s, `none` 2.3 s with no thinking. So `summarizer`,
-  `translator`, `classifier` and `extractor` send `reasoning_effort: minimal` to Gemini (`none` is rejected by flash-lite; `minimal` also gives zero thinking) (and `low` to
-  Groq), `coder` sends `low` to Gemini, while `researcher` and `reviewer` keep thinking. A role's
-  `reasoning_effort` may be a string (Groq only) or a `{provider: effort}` object. Thinking tokens
+  was truncated), `reasoning_effort: low` 18.0 s, `none`/`minimal` 2.3 s with no thinking
+  (`none` is rejected by flash-lite, `minimal` works everywhere). So `translator`, `classifier` and
+  `extractor` send `minimal` to Gemini (and `low` to Groq) and `coder` sends `low`. `summarizer`,
+  `researcher` and `reviewer` keep thinking: on a Turkish transcript `minimal` missed items the
+  default caught (5.8 s vs 18 s, +2.8K thinking tokens). Because Gemini's `max_tokens` includes
+  thinking (only actual usage is billed), auto `max_tokens` adds a 16K thinking allowance there.
+  A role's `reasoning_effort` may be a string (Groq only) or a `{provider: effort}` object. Thinking tokens
   are recorded in the ledger and shown in the usage report.
 - Results larger than 60K characters (Claude Code rejects tool results above ~25K tokens) are
   truncated; the full text is saved under `~/.config/ai-workers/results/` (newest 50 kept) and
@@ -431,9 +434,14 @@ behavior change.
 
 ### 1.6.1
 
-- Per-provider `reasoning_effort` (`{provider: effort}`); mechanical roles send `minimal` to Gemini (19.6 s to 2.3 s, no hidden thinking tokens measured).
+- `ai-workers doctor --live` probes every model the config can route to with the exact parameters roles send (`--no-openrouter` to save quota).
+- Per-provider `reasoning_effort` (`{provider: effort}`); light roles (translator, classifier, extractor) send `minimal` to Gemini (19.6 s to 2.3 s, no hidden thinking tokens).
 - Thinking tokens recorded in the ledger and the usage report (counted in Gemini tpm accounting).
 - `extractor` JSON validation, flash-lite fallback for light roles, UI efficiency panel, `reduce` uses auto `max_tokens`.
+- Gemini thinking allowance in auto `max_tokens`; `summarizer` keeps Gemini thinking (quality, measured).
+- Until a chars-per-token ratio is learned for a provider and script class, inputs up to 20% over the estimated limit are tried anyway (a rejected request is free and teaches the ratio); ratios are no longer learned from prompts under 2000 chars (template overhead skewed them).
+- Fallback headers group same-provider errors (`groq (3 models): input too large: ~8321 tokens`).
+- Modern theme overview scrolls again.
 
 ### 1.6.0
 

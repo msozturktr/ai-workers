@@ -64,13 +64,24 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class FallbackSummaryTest(unittest.TestCase):
+    def test_groups_same_provider_and_error(self):
+        route = [{"provider": "groq", "model": m, "error": f"input too large for groq/{m}: ~8321 tokens > 7800"}
+                 for m in ("a", "b", "c")] + [{"provider": "gemini", "model": "g", "error": "HTTP 500"}]
+        self.assertEqual(server._fb_summary(route),
+                         "groq (3 models): input too large: ~8321 tokens, gemini/g: HTTP 500")
+
+
 class ThinkingEffortTest(unittest.TestCase):
     def build(self, provider, model, effort):
         return P._build_payload(provider, model, [], 100, 0.2, effort)
 
     def test_role_defaults_per_provider(self):
-        eff = P.DEFAULT_ROLES["summarizer"]["reasoning_effort"]
+        eff = P.DEFAULT_ROLES["translator"]["reasoning_effort"]
         self.assertEqual(self.build("gemini", "gemini-3.6-flash", eff)["reasoning_effort"], "minimal")
+        # summarizer keeps Gemini thinking (measured quality loss with "minimal")
+        self.assertNotIn("reasoning_effort",
+                         self.build("gemini", "gemini-3.6-flash", P.DEFAULT_ROLES["summarizer"]["reasoning_effort"]))
         self.assertEqual(self.build("groq", "openai/gpt-oss-120b", eff)["reasoning_effort"], "low")
         self.assertNotIn("reasoning_effort", self.build("groq", "qwen/qwen3.8-27b", eff))
         self.assertNotIn("reasoning_effort", self.build("gemini", "gemini-3.6-flash", "low"))

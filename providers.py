@@ -4,7 +4,7 @@ import http.client, io, json, os, re, socket, threading, time, urllib.parse, url
 import activity as T
 import cache as C
 
-UA = "ai-workers/1.6 (+https://github.com/msozturktr/ai-workers) python-urllib"
+UA = "ai-workers/1.6.1 (+https://github.com/msozturktr/ai-workers) python-urllib"
 
 CONFIG_DIR = os.path.expanduser("~/.config/ai-workers")
 ENV_FILE = os.path.join(CONFIG_DIR, "env")
@@ -36,6 +36,8 @@ PROVIDERS = {
         "light_model": "gemini-3.5-flash-lite",
         # 1M token context; Tier 1 paid -> large-context tasks go here
         "max_input_chars": 1_500_000,
+        # max_tokens includes hidden thinking; only actual usage is billed
+        "thinking_in_max_tokens": True,
     },
     "groq": {
         "url": "https://api.groq.com/openai/v1/chat/completions",
@@ -72,7 +74,9 @@ DEFAULT_ROLES = {
                     "system": "You are a research analyst. Read the given source carefully and answer only from facts stated in it. Write 'unclear' where you are not sure. Default format: short bullets with numbered citations."},
     "summarizer":  {"provider": "groq", "model": "openai/gpt-oss-120b", "whole_files": True,
                     "max_tokens": 2048, "min_tokens": 512,
-                    "reasoning_effort": {"groq": "low", "gemini": "minimal"},
+                    # Gemini keeps thinking here: measured on a Turkish transcript, "minimal" missed
+                    # items and fields the default caught (5.8 s vs 18 s, +2.8K thinking tokens)
+                    "reasoning_effort": {"groq": "low"},
                     "system": "Summarize the text faithfully. Do not add new information or opinions. Default format: at most 8 bullets."},
     "coder":       {"provider": "groq", "model": "openai/gpt-oss-120b",
                     "max_tokens": 4096, "min_tokens": 1536, "reasoning_effort": {"gemini": "low"},
@@ -211,11 +215,28 @@ def chars_per_token(provider, model=None, cls="ascii"):
     return sum(vals) / len(vals) if vals else _default_cpt(cls)
 
 
+PROBE_SLACK = 1.2
+
+
+def _probe_slack(provider, cls="ascii"):
+    """Allow 20% over the input limit while no ratio is learned for this provider and script
+    class: the default is conservative, and a rejected 413/429 costs nothing but teaches it."""
+    _load_state()
+    with _state_lock:
+        known = any(p == provider and c == cls for (p, _m, c) in _cpt)
+    return 1.0 if known else PROBE_SLACK
+
+
 def est_tokens(provider, model, chars, cls="ascii"):
     return chars / chars_per_token(provider, model, cls) * CPT_MARGIN
 
 
+CPT_MIN_CHARS = 2000  # below this the fixed chat-template overhead (~70 tokens) skews the ratio
+
+
 def _learn_cpt(provider, model, chars, in_tokens, cls="ascii"):
+    if chars < CPT_MIN_CHARS:
+        return
     try:
         obs = chars / float(in_tokens)
     except (TypeError, ValueError, ZeroDivisionError):
@@ -384,7 +405,8 @@ def _input_cap_chars(provider, model, cls="ascii"):
     if not lim:
         return cfg["max_input_chars"]
     return min(cfg["max_input_chars"],
-               max(0, int((lim - INPUT_MARGIN_TOKENS) * chars_per_token(provider, model, cls) / CPT_MARGIN)))
+               max(0, int((lim - INPUT_MARGIN_TOKENS) * chars_per_token(provider, model, cls)
+                          / CPT_MARGIN * _probe_slack(provider, cls))))
 
 
 def input_budget(provider, max_tokens, model=None, cls="ascii"):
@@ -886,6 +908,9 @@ def _chat(sp, provider, prompt, system, model, max_tokens, temperature, retries,
     return res
 
 
+THINK_ALLOWANCE = 16384
+
+
 def _auto_tokens(spec, provider, model, size, max_tokens, cls="ascii"):
     """(max_tokens, skip_error) for one candidate. Explicit max_tokens passes through."""
     if max_tokens is not None:
@@ -896,10 +921,16 @@ def _auto_tokens(spec, provider, model, size, max_tokens, cls="ascii"):
     if spec.get("out_ratio"):
         floor = max(floor, int(est * spec["out_ratio"]))
     lim = input_limit(provider, model)
-    if lim and est > lim - INPUT_MARGIN_TOKENS:
+    if lim and est > (lim - INPUT_MARGIN_TOKENS) * _probe_slack(provider, cls):
         return None, (f"input too large for {provider}/{model}: ~{int(est)} tokens > "
                       f"{lim - INPUT_MARGIN_TOKENS}")
-    return max(cap, floor), None
+    mt = max(cap, floor)
+    if (PROVIDERS.get(provider) or {}).get("thinking_in_max_tokens"):
+        eff = spec.get("reasoning_effort")
+        eff = eff.get(provider) if isinstance(eff, dict) else None  # a plain string is Groq-only
+        if eff not in ("minimal", "none"):
+            mt += THINK_ALLOWANCE  # thinking (measured 2.8K-15K tokens) must not eat the answer
+    return mt, None
 
 
 def run(spec, prompt, max_tokens=None, model=None, no_fallback=False, role=None, no_cache=False):

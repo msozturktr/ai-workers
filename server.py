@@ -13,7 +13,7 @@ import usage as U
 import sources as S
 
 PROTOCOL = "2025-06-18"
-SERVER = {"name": "ai-workers", "version": "1.6.0"}
+SERVER = {"name": "ai-workers", "version": "1.6.1"}
 
 INSTRUCTIONS = """ai-workers: cheap worker models (Groq/OpenRouter free, Gemini for big inputs) for mechanical text work, so Claude's tokens go to thinking.
 Hand off: summaries, translation, classification, extraction, log/test-output scanning, per-file analysis, first-pass review, drafts.
@@ -263,9 +263,19 @@ def _job_result(job, res):
 def _fb_summary(fb):
     if isinstance(fb, str):
         return fb
+    out = []  # same provider + same error kind -> one entry (keeps headers short)
+    for x in fb:
+        err = str(x.get("error"))
+        if x.get("model"):
+            err = err.replace(f" for {x['provider']}/{x['model']}", "")
+        err = re.sub(r" > \d+$", "", err)[:80]
+        if out and out[-1][0] == x["provider"] and out[-1][2] == err:
+            out[-1][1].append(x.get("model"))
+            continue
+        out.append([x["provider"], [x.get("model")], err])
     return ", ".join(
-        f"{x['provider']}{'/' + x['model'] if x.get('model') else ''}: {str(x.get('error'))[:80]}"
-        for x in fb)
+        f"{p}/{ms[0]}: {e}" if len(ms) == 1 and ms[0] else f"{p} ({len(ms)} models): {e}"
+        for p, ms, e in out)
 
 
 PACK_ROLES = ("classifier", "extractor", "translator")

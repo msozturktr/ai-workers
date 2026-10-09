@@ -14,7 +14,7 @@
   ai-workers start|stop|restart|logs   systemd service
   ai-workers doctor          installation check
 """
-import argparse, json, os, shutil, subprocess, sys, urllib.request
+import argparse, concurrent.futures, json, os, shutil, subprocess, sys, threading, time, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -250,6 +250,104 @@ def cmd_service(a):
     return r.returncode
 
 
+def _sent_effort(provider, model, effort):
+    """reasoning_effort exactly as _build_payload would put it on the wire (or None)."""
+    return P._build_payload(provider, model, [], 1, 0, effort).get("reasoning_effort")
+
+
+def live_targets(roles=None):
+    """Distinct (provider, model, effort-as-sent) the configuration can route to, in order."""
+    roles = P.load_roles() if roles is None else roles
+    out, seen = [], set()
+
+    def add(prov, model, effort):
+        eff = _sent_effort(prov, model, effort)
+        if (prov, model, eff) not in seen:
+            seen.add((prov, model, eff))
+            out.append((prov, model, eff))
+
+    for spec in roles.values():
+        prov = spec["provider"]
+        pcfg = P.PROVIDERS.get(prov) or {}
+        eff = spec.get("reasoning_effort")
+        prim = spec.get("model") or pcfg.get("default_model")
+        add(prov, prim, eff)
+        for m in spec.get("pool") or pcfg.get("pool") or []:
+            add(prov, m, eff)
+        fm = spec.get("fallback_models") or {}
+        for q in P.FALLBACK_ORDER:
+            if q != prov:
+                add(q, fm.get(q) or P.PROVIDERS[q]["default_model"], eff)
+    return out
+
+
+def _live_call(prov, model, eff, lock):
+    arg = {prov: eff} if eff else None
+    t = time.time()
+    try:
+        if lock:
+            lock.acquire()
+        res = P.chat(prov, "Reply with the word OK.", model=model, max_tokens=64,
+                     reasoning_effort=arg, retries=1, role="doctor")
+    finally:
+        if lock:
+            lock.release()
+    return res, time.time() - t
+
+
+def doctor_live(no_openrouter=False):
+    """Probe every routable model with the parameters roles send. Returns True if none failed."""
+    targets = live_targets()
+    have = P.available_providers()
+    print("\n# live model check\n")
+    n_or = sum(1 for p, _, _ in targets if p == "openrouter" and p in have)
+    if no_openrouter:
+        targets = [t for t in targets if t[0] != "openrouter"]
+    elif n_or:
+        print(f"note: live doctor uses {n_or} openrouter request(s) (~50/day free quota); "
+              "skip with --no-openrouter\n")
+    lock = threading.Lock()
+    rows = [None] * len(targets)
+    jobs = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
+        for i, (prov, model, eff) in enumerate(targets):
+            if prov not in have:
+                rows[i] = ("SKIP   ", "no key")
+                continue
+            cool = P._cooling(prov, model)
+            if cool:
+                rows[i] = ("COOLING", cool.replace("cooling down ", ""))
+                continue
+            jobs[ex.submit(_live_call, prov, model, eff, lock if prov == "openrouter" else None)] = i
+        for f in concurrent.futures.as_completed(jobs):
+            i = jobs[f]
+            try:
+                res, dt = f.result()
+            except Exception as e:
+                res, dt = {"ok": False, "error": f"{type(e).__name__}: {e}"}, 0.0
+            if res.get("ok"):
+                rows[i] = ("OK     ", f"{dt:.2f} s")
+            else:
+                rows[i] = ("FAIL   ", str(res.get("error"))[:120])
+    ok, hints = True, []
+    for (prov, model, eff), (mark, info) in zip(targets, rows):
+        e = f" effort={eff}" if eff else ""
+        sep = "  " if mark in ("OK     ", "FAIL   ") else " "
+        print(f"[{mark}] {prov} {model}{e}{sep}{info}")
+        if mark == "FAIL   ":
+            ok = False
+            low = info.lower()
+            if "404" in info or "model_not_found" in low:
+                hints.append(f"-> {prov} {model}: run: ai-workers models {prov}")
+            elif "400" in info and eff:
+                hints.append(f"-> {prov} {model}: effort '{eff}' may be unsupported for this model "
+                             "(the server retries without it, but fix the role config)")
+    if hints:
+        print()
+        print("\n".join(hints))
+    return ok
+
+
 def cmd_doctor(a):
     ok = True
     print("# ai-workers doctor\n")
@@ -302,6 +400,9 @@ def cmd_doctor(a):
         print("[-      ] claude -p /usage: taking first measurement")
     else:
         print(f"[MISSING] claude -p /usage: {live.get('error')}")
+
+    if getattr(a, "live", False):
+        ok = doctor_live(getattr(a, "no_openrouter", False)) and ok
 
     print("\n" + ("ready." if ok else "there are missing items (see above)."))
     return 0 if ok else 1
@@ -371,6 +472,10 @@ def main():
         p.set_defaults(fn=cmd_service, action=act)
 
     p = sub.add_parser("doctor", help="installation check")
+    p.add_argument("--live", action="store_true",
+                   help="also probe every routable model with the parameters roles send (network)")
+    p.add_argument("--no-openrouter", action="store_true",
+                   help="with --live: skip openrouter (small daily free quota)")
     p.set_defaults(fn=cmd_doctor)
 
     T.configure(source="cli")

@@ -243,7 +243,7 @@ class RouterTest(unittest.TestCase):
         self.assertEqual(r["provider"], "gemini")
         self.assertEqual(len(self.calls), 1)
         self.assertIn("generativelanguage", self.calls[0][0])
-        self.assertEqual(self.calls[0][1]["max_tokens"], 2048)
+        self.assertEqual(self.calls[0][1]["max_tokens"], 2048 + P.THINK_ALLOWANCE)  # Gemini thinking allowance
         self.assertEqual([x["model"] for x in r["route"]],
                          ["openai/gpt-oss-120b", "qwen/qwen3.8-27b", "openai/gpt-oss-20b"])
         self.assertIn("input too large", r["route"][0]["error"])
@@ -423,8 +423,17 @@ class LearnedRatioTest(unittest.TestCase):
             P._learn_cpt("groq", "hi", 100000, 1)
         self.assertAlmostEqual(P.chars_per_token("groq", "hi"), P.CPT_MAX, places=3)
         for _ in range(60):
-            P._learn_cpt("groq", "lo", 1, 100000)
+            P._learn_cpt("groq", "lo", 2000, 100000)
         self.assertAlmostEqual(P.chars_per_token("groq", "lo"), P.CPT_MIN, places=3)
+
+    def test_tiny_prompts_not_learned(self):
+        P._learn_cpt("groq", "tiny", 400, 200)  # template overhead dominates
+        self.assertNotIn(("groq", "tiny", "ascii"), P._cpt)
+
+    def test_probe_slack_until_learned(self):
+        self.assertEqual(P._probe_slack("openrouter", "intl"), P.PROBE_SLACK)
+        P._learn_cpt("openrouter", "m", 4000, 1500, "intl")
+        self.assertEqual(P._probe_slack("openrouter", "intl"), 1.0)
 
     def test_persisted(self):
         P._learn_cpt("groq", "m", 4000, 1000)
